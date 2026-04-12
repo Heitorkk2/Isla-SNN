@@ -1,0 +1,25 @@
+{
+  "hidden_dim": 768,
+  "num_layers": 12,
+  "num_heads": 12,
+  "ff_mult": 4,
+  "num_timesteps": 8,
+  "max_seq_len": 2048,
+  "dropout": 0.1,
+  "beta_init": 0.5,
+  "threshold": 0.3,
+  "surrogate_slope": 25.0,
+  "sync_tau_init": 1.0,
+  "spike_reg_lambda": 0.05,
+  "target_spike_rate": 0.3,
+  "use_standard_attention": false,
+  "compile": false,
+  "tokenizer_name": "NousResearch/Llama-2-7b-hf",
+  "_nota": "v3: 150M params | Gate residual aprendível | 8 timesteps | 2048 ctx | Dataset trilíngue EN/PT/Code",
+  "_improvements": [
+    "Gated residual (aprende balanço spike vs direto)",
+    "8 timesteps (2x mais informação temporal)",
+    "2048 context (2x maior)",
+    "3x mais parâmetros (768d × 12L)"
+  ]
+}
