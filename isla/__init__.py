@@ -1,17 +1,24 @@
 """Isla-SNN: Spiking Neural Network Language Model with Spike Synchrony Attention.
 
+v3 features:
+    - Gated additive residual (spikes always active + learnable boost)
+    - Membrane potential as continuous feature (spike + α·membrane)
+    - Spike Frequency Adaptation (dynamic threshold)
+
 Notebook usage:
     import isla
 
-    model_config = isla.ModelConfig(hidden_dim=256, num_layers=4)
-    train_config = isla.TrainConfig(lr=3e-4, batch_size=16)
+    model_config = isla.ModelConfig(hidden_dim=512, num_layers=8, num_heads=8,
+                                    num_timesteps=4, max_seq_len=1024)
+    train_config = isla.TrainConfig(lr=3e-4, batch_size=16,
+                                    gradient_accumulation_steps=4)
     data_config  = isla.DataConfig(dataset_path="./data/corpus.jsonl")
 
     model, tokenizer = isla.train(model_config, train_config, data_config)
     text = isla.generate(model, tokenizer, "Hello")
 
 CLI usage:
-    python main.py --data ./data/corpus.jsonl
+    python main.py --data ./data/corpus.jsonl --hidden-dim 512 --num-layers 8
 """
 
 from typing import Optional, Tuple
@@ -83,7 +90,7 @@ def load_model(
     return model, tokenizer
 
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 __all__ = [
     "ModelConfig", "TrainConfig", "DataConfig", "CheckpointConfig", "WandbConfig",
     "IslaModel", "IslaTrainer",

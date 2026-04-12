@@ -47,46 +47,67 @@ def spike_fn(membrane, threshold=1.0, slope=25.0):
 class LIFNeuron(nn.Module):
     """Leaky Integrate-and-Fire neuron with per-unit learnable decay.
 
+    v3 additions:
+    - Spike Frequency Adaptation (SFA): threshold rises after firing,
+      forcing diverse neuronal activity. Controlled by learnable
+      adaptation_strength (decays at fixed rate adaptation_decay).
+    - multi_step returns final_membrane for use as continuous feature.
+
     The decay β is parameterised as sigmoid(raw) so it stays in (0, 1)
     without explicit clamping, and gradients flow freely.
     """
 
-    def __init__(self, dim, beta=0.9, threshold=1.0, slope=25.0):
+    def __init__(self, dim, beta=0.9, threshold=1.0, slope=25.0,
+                 adaptation_decay=0.9):
         super().__init__()
-        self.threshold = threshold
+        self.base_threshold = threshold
         self.slope = slope
+        self.adaptation_decay = adaptation_decay
         # inverse-sigmoid of the initial beta
         raw = torch.log(torch.tensor(beta / (1.0 - beta)))
         self.beta_raw = nn.Parameter(torch.full((dim,), raw.item()))
+        # SFA: learnable adaptation strength (init near zero = subtle)
+        self.adaptation_strength = nn.Parameter(torch.full((dim,), 0.1))
 
     @property
     def beta(self):
         return torch.sigmoid(self.beta_raw)
 
-    def step(self, current, membrane=None):
-        """Integrate one timestep. Returns (spikes, new_membrane)."""
+    def step(self, current, membrane=None, adaptation=None):
+        """Integrate one timestep. Returns (spikes, new_membrane, new_adaptation)."""
         if membrane is None:
             membrane = torch.zeros_like(current)
+        if adaptation is None:
+            adaptation = torch.zeros_like(current)
+        # dynamic threshold: rises when neuron fires (spike frequency adaptation)
+        threshold = self.base_threshold + adaptation
         membrane = self.beta * membrane + current
-        spikes = spike_fn(membrane, self.threshold, self.slope)
+        spikes = spike_fn(membrane, threshold, self.slope)
         membrane = membrane * (1.0 - spikes.detach())  # hard reset
-        return spikes, membrane
+        # adaptation: rises on spike, decays otherwise
+        adaptation = self.adaptation_decay * adaptation + \
+                     torch.relu(self.adaptation_strength) * spikes.detach()
+        return spikes, membrane, adaptation
 
     def multi_step(self, current, T):
-        """Integrate T timesteps with the same input current (vectorised).
+        """Integrate T timesteps with the same input current.
 
-        When the input is constant across all timesteps (as in SpikingMLP),
-        this avoids the Python-loop overhead by unrolling with in-place ops.
         Returns (spike_sum, final_membrane, mean_rate_per_unit).
+        final_membrane is exposed so SpikingMLP can use it as a
+        continuous feature alongside binary spikes (v3 improvement).
         """
         beta = self.beta
         membrane = torch.zeros_like(current)
+        adaptation = torch.zeros_like(current)
         spike_sum = torch.zeros_like(current)
 
         for _ in range(T):
+            threshold = self.base_threshold + adaptation
             membrane = beta * membrane + current
-            spikes = spike_fn(membrane, self.threshold, self.slope)
+            spikes = spike_fn(membrane, threshold, self.slope)
             membrane = membrane * (1.0 - spikes.detach())
+            adaptation = self.adaptation_decay * adaptation + \
+                         torch.relu(self.adaptation_strength) * spikes.detach()
             spike_sum = spike_sum + spikes
 
         # per-unit rate averaged over batch and sequence dims (keep hidden dim)
@@ -96,8 +117,9 @@ class LIFNeuron(nn.Module):
     def forward(self, currents):
         """Process a full time-series. currents: (T, *, dim)."""
         membrane = None
+        adaptation = None
         all_spikes = []
         for t in range(currents.shape[0]):
-            s, membrane = self.step(currents[t], membrane)
+            s, membrane, adaptation = self.step(currents[t], membrane, adaptation)
             all_spikes.append(s)
         return torch.stack(all_spikes, dim=0), membrane

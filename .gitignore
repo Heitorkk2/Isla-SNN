@@ -5,28 +5,45 @@ __pycache__/
 dist/
 build/
 *.egg
+.eggs/
 
-# Training outputs
+# Training outputs & checkpoints
 outputs/
 *.pth
 train_log.jsonl
 
-# Datasets (cached)
+# Datasets (raw + cached)
+data/
 *_tokenized/
+*_packed/
 *.cache
+
+# HuggingFace cache
+hf_cache/
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
+.gemini/
 
 # OS
 .DS_Store
 Thumbs.db
+desktop.ini
 
 # Jupyter
 .ipynb_checkpoints/
 
 # W&B
 wandb/
+
+# Review / temp
+_v3_review/
+
+# Archives
+*.rar
+*.zip
+*.7z
+*.tar.gz

@@ -43,10 +43,11 @@ class RMSNorm(nn.Module):
 class SpikingMLP(nn.Module):
     """Feed-forward block whose nonlinearity is a bank of LIF neurons.
 
-    x → up-project → LIF(T steps, same input) → mean spike rate → down-project
+    v3: Uses both binary spike AND continuous membrane potential as features.
+    x → up-project → LIF(T steps) → spike + α·membrane → down-project
 
-    Uses LIFNeuron.multi_step() for efficient T-step integration with
-    per-unit spike rate tracking.
+    The α parameter is learnable, letting the model decide how much
+    continuous voltage information to mix with binary spikes.
     """
 
     def __init__(self, config: ModelConfig):
@@ -57,17 +58,33 @@ class SpikingMLP(nn.Module):
         self.lif = LIFNeuron(d_ff, config.beta_init, config.threshold, config.surrogate_slope)
         self.T = config.num_timesteps
         self.dropout = nn.Dropout(config.dropout)
+        # learnable membrane mixing coefficient
+        # sigmoid keeps it in (0,1); init at -2 → sigmoid(-2) ≈ 0.12 (subtle start)
+        self.alpha_raw = nn.Parameter(torch.full((1,), -2.0))
+
+    @property
+    def alpha(self):
+        return torch.sigmoid(self.alpha_raw)
 
     def forward(self, x):
         h = self.up(x)
-        spike_sum, _, rate_per_unit = self.lif.multi_step(h, self.T)
+        spike_sum, membrane, rate_per_unit = self.lif.multi_step(h, self.T)
         rate = spike_sum / self.T
+        # mix spike (binary) + alpha * membrane (continuous)
+        mixed = rate + self.alpha * membrane.clamp(-1, 1)
         self._last_rates = rate_per_unit.detach()  # for diagnostics
-        return self.dropout(self.down(rate)), rate_per_unit
+        return self.dropout(self.down(mixed)), rate_per_unit
 
 
 class SpikingBlock(nn.Module):
-    """Pre-norm residual block with spike-synchrony attention and spiking MLP."""
+    """Pre-norm residual block with spike-synchrony attention and spiking MLP.
+
+    v3: Safe additive gated residual. Spikes ALWAYS flow (never bypassed).
+    An optional learned gate adds a residual boost on top:
+        h = spike_out + gate * h_pre
+    gate=0 → pure spike (v2). gate>0 → spike + boost.
+    The gate can NEVER kill spikes, it only enhances them.
+    """
 
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -80,12 +97,21 @@ class SpikingBlock(nn.Module):
         )
         self.mlp_norm = RMSNorm(config.hidden_dim)
         self.mlp = SpikingMLP(config)
+        # additive gate: sigmoid(-2) ≈ 0.12 at init — subtle residual boost
+        self.gate_raw = nn.Parameter(torch.full((1,), -2.0))
+
+    @property
+    def gate(self):
+        return torch.sigmoid(self.gate_raw)
 
     def forward(self, h, mask=None, cache=None):
         attn_out, cache = self.attn(self.attn_norm(h), mask, cache=cache)
-        h = h + attn_out
+        h = h + attn_out  # attention residual: kept
+        h_pre = h  # save for residual boost
         mlp_out, spike_rate = self.mlp(self.mlp_norm(h))
-        return h + mlp_out, spike_rate, cache
+        # safe additive gate: spikes always active + optional residual boost
+        h = mlp_out + self.gate * h_pre
+        return h, spike_rate, cache
 
 
 class IslaModel(nn.Module):

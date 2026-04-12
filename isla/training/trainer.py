@@ -72,7 +72,7 @@ class IslaTrainer:
         for name, p in model.named_parameters():
             if not p.requires_grad:
                 continue
-            if any(k in name for k in ("bias", "norm", "emb", "beta_raw", "tau_raw")):
+            if any(k in name for k in ("bias", "norm", "emb", "beta_raw", "tau_raw", "gate_raw", "alpha_raw", "adaptation_strength")):
                 no_wd_params.append(p)
             else:
                 wd_params.append(p)
@@ -235,6 +235,30 @@ class IslaTrainer:
         if total_neurons > 0:
             diag["diag/dead_neurons_pct"] = total_dead / total_neurons * 100
             diag["diag/saturated_neurons_pct"] = total_saturated / total_neurons * 100
+
+        # v3 diagnostics: gate values, alpha (membrane mixing), SFA adaptation
+        gate_values = []
+        alpha_values = []
+        adapt_values = []
+        for i, block in enumerate(self._raw_model.blocks):
+            if hasattr(block, "gate"):
+                g = block.gate.item()
+                diag[f"diag/gate_layer_{i}"] = g
+                gate_values.append(g)
+            if hasattr(block.mlp, "alpha"):
+                a = block.mlp.alpha.item()
+                diag[f"diag/alpha_layer_{i}"] = a
+                alpha_values.append(a)
+            if hasattr(block.mlp.lif, "adaptation_strength"):
+                ad = torch.relu(block.mlp.lif.adaptation_strength).mean().item()
+                diag[f"diag/sfa_strength_layer_{i}"] = ad
+                adapt_values.append(ad)
+        if gate_values:
+            diag["diag/gate_mean"] = sum(gate_values) / len(gate_values)
+        if alpha_values:
+            diag["diag/alpha_mean"] = sum(alpha_values) / len(alpha_values)
+        if adapt_values:
+            diag["diag/sfa_strength_mean"] = sum(adapt_values) / len(adapt_values)
 
         return diag
 

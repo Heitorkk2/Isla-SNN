@@ -25,10 +25,11 @@ Isla explores a different path for neural attention: instead of dot-product simi
 import isla
 
 model_config = isla.ModelConfig(
-    hidden_dim=256,
-    num_layers=4,
+    hidden_dim=512,
+    num_layers=8,
+    num_heads=8,
     num_timesteps=4,
-    max_seq_len=1024,
+    max_seq_len=2048,
     target_spike_rate=0.3,
 )
 
@@ -36,14 +37,12 @@ train_config = isla.TrainConfig(
     lr=3e-4,
     batch_size=16,
     gradient_accumulation_steps=4,
-    max_steps=60_000,
     bf16=True,
     gradient_checkpointing=True,
 )
 
 data_config = isla.DataConfig(
-    dataset_path="./data/corpus.jsonl",
-    tokenizer_name="codelion/gpt-2-70m",
+    dataset_path="./data/my_dataset_tokenized",
     pack_sequences=True,  # concatenate+chunk, no padding waste
 )
 
@@ -64,40 +63,6 @@ for piece in isla.generate_stream(model, tokenizer, "Hello"):
     print(piece, end="", flush=True)
 ```
 
-### Benchmark
-
-Evaluate the model on standard NLP benchmarks using the `lm-evaluation-harness` wrapper. We provide a `run_benchmark.py` script that adapts Isla-SNN to evaluate standard datasets smoothly.
-
-```bash
-# Run benchmarks (e.g. PiQA, Winogrande, HellaSwag, ARC)
-python run_benchmark.py
-```
-
-**Results (16M parameters, ~177M tokens):**
-
-<p align="center">
-  <img src="assets/benchmark.png" alt="Benchmark Comparison" height="200">
-</p>
-
-*(Note: As expected for an extremely low-parameter and low-token early run, these metrics represent the statistical chance baseline).*
-
-> **Dataset Citation**: 
-> The Isla-SNN models detailed here are pre-trained on [Codelion's GPT-2 70M optimal dataset mixing techniques](https://huggingface.co/blog/codelion/optimal-dataset-mixing). Huge thanks to their research on dataset optimizations, which enables our Spiking architecture to converge effectively on smaller computational constraints.
-
-### Example Output
-
-Despite not having learned advanced logic, the early models successfully collapse into coherent grammatical syntax using biological Spikes. Example generation for a 16M model:
-
-> **Prompt:** How much is 1+1?
-> 
-> **Isla-SNN:** *The only thing is not a way for all I don't know how it does you do, but I'm just say that I'm in my mind. And I would be good about the answer to me to me and I know to give me*
-
-### CLI
-
-```bash
-python main.py --data ./data/corpus.jsonl --gradient-checkpointing --max-steps 60000
-```
-
 ### Install
 
 ```bash
@@ -110,12 +75,12 @@ pip install -e ".[dev]"     # with pytest, wandb, matplotlib
 ```
 Isla-SNN/
 ├── isla/                          # framework package
-│   ├── __init__.py                # public API with type hints
+│   ├── __init__.py                # public API (train, generate, load_model)
 │   ├── config.py                  # all config dataclasses (with validation)
 │   ├── model/
-│   │   ├── neurons.py             # LIF neuron + surrogate gradient + multi_step
+│   │   ├── neurons.py             # LIF neuron + SFA + surrogate gradient
 │   │   ├── attention.py           # spike sync attention + RoPE + KV cache
-│   │   └── architecture.py        # IslaModel, SpikingBlock (on-the-fly mask)
+│   │   └── architecture.py        # IslaModel, SpikingBlock, gated residual
 │   ├── data/
 │   │   └── loader.py              # HF datasets + tokenizer + packing + caching
 │   ├── training/
@@ -124,15 +89,18 @@ Isla-SNN/
 │       ├── generate.py            # generate + stream with KV cache
 │       └── speed.py               # torch.compile + CUDA tuning
 ├── main.py                        # CLI entry point
+├── chat.py                        # interactive chat REPL
 ├── pyproject.toml                 # packaging (pip install -e .)
-├── configs/
-│   ├── small.json                 # ~16M params
-│   ├── medium.json                # ~54M params
-│   └── ablation_standard_attn.json
+├── examples/
+│   ├── config_nano.json           # ~4M params (testing)
+│   ├── config_50m.json            # ~50M params
+│   ├── config_150m.json           # ~150M params
+│   └── prepare_data.py            # multi-source dataset preparation
 ├── notebooks/
 │   ├── 00_dataset_caching.ipynb   # pre-tokenize datasets
 │   ├── 01_train.ipynb             # Colab training
-│   └── 02_inference.ipynb         # inference + spike analysis
+│   ├── 02_inference.ipynb         # inference + spike analysis
+│   └── 03_finetune_chat.ipynb     # instruction fine-tuning
 └── tests/
     ├── test_model.py
     └── verify_all.py              # full verification suite
@@ -189,7 +157,6 @@ Each neuron has a learnable decay `β ∈ (0,1)`. The output is the mean spike r
 |---|---|
 | **O(L²) attention** | Spike sync attention uses custom RBF kernel — not compatible with FlashAttention or xformers. Sequence lengths above 2048 will be slow. |
 | **Sequential LIF timesteps** | Each spiking MLP runs T timesteps sequentially (T=4 by default), making FFN blocks ~4× slower than standard GELU/SiLU. |
-| **Scale** | Tested up to ~16M params. Behavior at 100M+ is unknown — spike dynamics may need retuning (threshold, β init, surrogate slope). |
 | **Single GPU** | No distributed training (DDP/FSDP) support yet. |
 
 ## Requirements
@@ -207,20 +174,25 @@ pip install -q pandas matplotlib wandb
 pip install git+https://github.com/EleutherAI/lm-evaluation-harness.git
 ```
 
-## To-Do
+## Data Acknowledgements
 
-- [ ] **Scale Up**: Train medium config (model >= ~50M parameters) on 1B tokens.
-- [ ] **Data Pipeline**: Refine blending distributions for optimal logic acquisition.
-- [ ] **Performance**: Profile and write custom CUDA/Triton kernels for the Spiking MLP and RBF Attention (O(L²)) to drop sequence limits.
-- [ ] **Hardware Support**: Introduce multi-GPU distributed training (DDP / FSDP).
+The Isla-SNN pre-training dataset (~1B tokens) is composed of:
+
+| Source | Weight | License |
+|--------|--------|---------|
+| [FineWeb-Edu 1B](https://huggingface.co/datasets/codelion/fineweb-edu-1B) (English) | 60% | ODC-By 1.0 |
+| [Portuguese-PD](https://huggingface.co/datasets/PleIAs/Portuguese-PD) (PT-BR) | 30% | Public Domain |
+| [instruct-python-500k](https://huggingface.co/datasets/luisroque/instruct-python-500k) (Code) | 5% | CC-BY-SA 3.0 |
+| [NuminaMath-CoT](https://huggingface.co/datasets/AI-MO/NuminaMath-CoT) (Math) | 5% | CC-BY 4.0 |
+
+Tokenized with [Tucano2-qwen-3.7B](https://huggingface.co/Polygl0t/Tucano2-qwen-3.7B-Base) tokenizer (49k vocab, 2048 seq length).
 
 ## References
 
 - Neftci, E. O., Mostafa, H., & Zenke, F. (2019). **Surrogate Gradient Learning in Spiking Neural Networks**: Bringing the Power of Gradient-Based Optimization to Spiking Neural Networks. *IEEE Signal Processing Magazine*.
 - Zenke, F., & Ganguli, S. (2018). **SuperSpike**: Supervised Learning in Multilayer Spiking Neural Networks. *Neural Computation*.
 - Zhu, R.-J., Zhao, Q., Li, H., & Wu, P. (2023). **SpikeGPT**: Generative Pre-trained Language Model with Spiking Neural Networks. *arXiv*.
-- Codelion (2025). **Optimal Dataset Mixing Techniques**: Guidelines for constrained pre-training regimes. *Hugging Face Blog*.
 
 ## License
 
-MIT
+MIT — The Isla-SNN framework code is released under the MIT License. Trained model weights are released under the same license. Training data retains its original licensing (see acknowledgements above).

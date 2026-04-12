@@ -36,6 +36,9 @@ def _sample_next(logits, generated_ids, temperature, top_k, top_p, repetition_pe
         score = torch.where(score > 0, score / repetition_penalty, score * repetition_penalty)
         nxt.scatter_(1, generated_ids, score)
 
+    if temperature == 0.0:
+        return torch.argmax(nxt, dim=-1, keepdim=True)
+
     if temperature != 1.0:
         nxt = nxt / temperature
 
@@ -59,6 +62,7 @@ def generate_stream(model, tokenizer, prompt, max_new_tokens=100, temperature=0.
     model.eval()
     ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
     generated = ids
+    prev_text = tokenizer.decode(ids[0], skip_special_tokens=True)
 
     caches = [KVCache() for _ in range(model.config.num_layers)] if use_cache else None
     logits, _, caches = model(ids, caches=caches)
@@ -67,7 +71,11 @@ def generate_stream(model, tokenizer, prompt, max_new_tokens=100, temperature=0.
         token = _sample_next(logits, generated, temperature, top_k, top_p, repetition_penalty)
         generated = torch.cat([generated, token], dim=1)
 
-        yield tokenizer.decode(token[0], skip_special_tokens=True)
+        # decode full sequence and yield only new chars (preserves SentencePiece spaces)
+        full_text = tokenizer.decode(generated[0], skip_special_tokens=True)
+        new_text = full_text[len(prev_text):]
+        prev_text = full_text
+        yield new_text
 
         if token.item() == tokenizer.eos_token_id:
             break
