@@ -21,27 +21,22 @@ import torch
 import torch.nn as nn
 
 
-class _SurrogateSpike(torch.autograd.Function):
-    """Custom autograd: Heaviside forward, fast-sigmoid backward."""
-
-    @staticmethod
-    def forward(ctx, membrane, threshold, slope):
-        ctx.save_for_backward(membrane)
-        ctx.threshold = threshold
-        ctx.slope = slope
-        return (membrane >= threshold).float()
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        (membrane,) = ctx.saved_tensors
-        base = 1.0 + ctx.slope * (membrane - ctx.threshold).abs()
-        grad = 1.0 / (base * base)
-        return grad_output * grad, None, None
-
-
 def spike_fn(membrane, threshold=1.0, slope=25.0):
-    """Differentiable spike function via surrogate gradient."""
-    return _SurrogateSpike.apply(membrane, threshold, slope)
+    """Differentiable spike function via surrogate gradient.
+    Implemented purely in PyTorch (Straight-Through Estimator).
+    This bypasses torch.autograd.Function entirely, preventing
+    massive Graph Breaks when used with torch.compile().
+    """
+    # Forward: Hard Heaviside step
+    hard_spike = (membrane >= threshold).float()
+    
+    # Backward: Surrogate Fast Sigmoid (f' = 1 / (1 + slope * |x|)^2)
+    # The pure function f(x) = x / (1 + slope * |x|) yields exactly this derivative.
+    x = membrane - threshold
+    surrogate = x / (1.0 + slope * x.abs())
+    
+    # STE: forward uses hard_spike, backward flows through surrogate
+    return (hard_spike - surrogate).detach() + surrogate
 
 
 class LIFNeuron(nn.Module):

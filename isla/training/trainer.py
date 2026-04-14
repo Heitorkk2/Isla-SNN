@@ -176,7 +176,7 @@ class IslaTrainer:
 
     def _forward_backward(self, batch):
         ids = batch["input_ids"].to(self.device)
-        labels = batch["labels"].to(self.device)
+        labels = batch.get("labels", ids).to(self.device)
 
         with _get_amp_context(self.device, self.amp_dtype, self.use_amp):
             logits, metrics, _ = self.model(ids)
