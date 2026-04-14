@@ -180,11 +180,12 @@ class IslaTrainer:
 
         with _get_amp_context(self.device, self.amp_dtype, self.use_amp):
             logits, metrics, _ = self.model(ids)
-            # Flattening to 2D forces the memory pointer to be fully contiguous.
-            # Hopper (H100) and Blackwell (5070) bfloat16 ATen kernels crash with Illegal Memory Access
-            # if passed a transposed 3D dimension due to unaligned CUDA warp boundaries.
-            shift_logits = logits[:, :-1].contiguous().view(-1, self.model_cfg.vocab_size)
-            shift_labels = labels[:, 1:].contiguous().view(-1)
+            
+            # Avoid contiguous() to save ~5GB VRAM on LM Head
+            # We reshape to (B, Vocab, L-1) and labels to (B, L-1)
+            shift_logits = logits[:, :-1, :].transpose(1, 2)
+            shift_labels = labels[:, 1:]
+            
             ce = self.criterion(shift_logits, shift_labels)
 
             # spike penalty: target rate or raw rate
