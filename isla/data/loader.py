@@ -32,6 +32,75 @@ def get_tokenizer(name="codelion/gpt-2-70m"):
     return tok
 
 
+def _tokenize_finetune(texts, tokenizer, token_limit, response_template):
+    """Tokenize prompt and response separately, then concatenate.
+
+    Locating the response by searching for the template's token ids inside the
+    full encoding does not survive a change of tokenizer. SentencePiece merges
+    depend on preceding context, so '### Response:\\n' encodes one way alone and
+    another mid-text — and the trailing ':\\n' fuses with the response's first
+    letter, so even a character-offset match would drop that first token.
+
+    Encoding the two halves separately sidesteps both problems and makes the
+    prompt boundary identical to what inference sees, since generation also
+    encodes the prompt on its own.
+    """
+    prompts, responses, n_unmatched = [], [], 0
+    for text in texts:
+        idx = text.find(response_template)
+        if idx == -1:
+            # No boundary: supervise the whole text rather than silently
+            # training on a prompt that was never identified.
+            prompts.append("")
+            responses.append(text)
+            n_unmatched += 1
+        else:
+            cut = idx + len(response_template)
+            prompts.append(text[:cut])
+            responses.append(text[cut:])
+
+    p_enc = tokenizer(prompts, add_special_tokens=True, truncation=False)
+    r_enc = tokenizer(responses, add_special_tokens=False, truncation=False)
+
+    input_ids, labels, attn_masks, n_dropped = [], [], [], 0
+    for p_ids, r_ids in zip(p_enc["input_ids"], r_enc["input_ids"]):
+        # Keep the response whole when the pair overflows: a truncated prompt
+        # still conditions the model, a truncated response teaches it to stop
+        # mid-sentence.
+        room = token_limit - len(r_ids)
+        if room <= 0:
+            r_ids = r_ids[:token_limit]
+            p_ids = []
+        elif len(p_ids) > room:
+            p_ids = p_ids[:room]
+
+        if not r_ids:
+            n_dropped += 1
+            continue
+
+        ids = list(p_ids) + list(r_ids)
+        input_ids.append(ids)
+        labels.append([-100] * len(p_ids) + list(r_ids))
+        attn_masks.append([1] * len(ids))
+
+    if n_unmatched:
+        warnings.warn(
+            f"response_template {response_template!r} not found in "
+            f"{n_unmatched}/{len(texts)} examples; their prompts are unmasked "
+            f"and will contribute to the loss. Check that the template appears "
+            f"verbatim in the formatted text.",
+            stacklevel=2,
+        )
+    if n_dropped:
+        warnings.warn(
+            f"dropped {n_dropped}/{len(texts)} examples with no response "
+            f"tokens left after truncation.",
+            stacklevel=2,
+        )
+
+    return {"input_ids": input_ids, "attention_mask": attn_masks, "labels": labels}
+
+
 def _tokenize_batch(examples, tokenizer, max_seq_len, is_finetune=False,
                     response_template="<|im_start|>assistant\n", pack=False):
     """Tokenize for causal LM.
@@ -47,6 +116,10 @@ def _tokenize_batch(examples, tokenizer, max_seq_len, is_finetune=False,
 
     eos_token_id = getattr(tokenizer, "eos_token_id", None)
     token_limit = max_seq_len - 1 if pack and eos_token_id is not None else max_seq_len
+
+    if is_finetune and response_template:
+        return _tokenize_finetune(texts, tokenizer, token_limit, response_template)
+
     # Never pad here: fixed-width rows would bake <pad> into the cached dataset
     # and force every batch to max_seq_len, which is quadratically expensive in
     # the sync-attention kernel. _collate pads per batch instead.
@@ -59,53 +132,12 @@ def _tokenize_batch(examples, tokenizer, max_seq_len, is_finetune=False,
                 ids.append(eos_token_id)
                 attn.append(1)
 
-    labels = []
-    
-    if is_finetune and response_template:
-        # Encode the template
-        response_token_ids = tokenizer.encode(response_template, add_special_tokens=False)
-        resp_len = len(response_token_ids)
-        n_unmatched = 0
+    # Default Causal LM pre-training logic
+    labels = [
+        [tok_id if mask == 1 else -100 for tok_id, mask in zip(ids, attn)]
+        for ids, attn in zip(enc["input_ids"], enc["attention_mask"])
+    ]
 
-        for ids, attn in zip(enc["input_ids"], enc["attention_mask"]):
-            # Find the starting index of the response template in the tokens
-            match_idx = -1
-            for i in range(len(ids) - resp_len + 1):
-                if ids[i:i+resp_len] == response_token_ids:
-                    match_idx = i + resp_len  # Compute loss exactly AFTER the template finishes
-                    break
-            
-            # Mask anything before match_idx or any padding
-            cur_labels = []
-            for i, (tok_id, mask) in enumerate(zip(ids, attn)):
-                if mask == 0:
-                    cur_labels.append(-100) # Mask padding
-                elif match_idx != -1 and i < match_idx:
-                    cur_labels.append(-100) # Mask human prompt
-                else:
-                    cur_labels.append(tok_id)
-            labels.append(cur_labels)
-            if match_idx == -1:
-                n_unmatched += 1
-
-        if n_unmatched:
-            # A miss means the prompt was NOT masked and is being trained on as
-            # if it were a response. BPE can split the template differently in
-            # context, so this must be loud rather than silently degrading.
-            warnings.warn(
-                f"response_template {response_template!r} not found in "
-                f"{n_unmatched}/{len(labels)} examples; their prompts are "
-                f"unmasked and will contribute to the loss. Check that the "
-                f"template tokenizes identically inside the full text.",
-                stacklevel=2,
-            )
-    else:
-        # Default Causal LM pre-training logic
-        labels = [
-            [tok_id if mask == 1 else -100 for tok_id, mask in zip(ids, attn)]
-            for ids, attn in zip(enc["input_ids"], enc["attention_mask"])
-        ]
-        
     return {"input_ids": enc["input_ids"], "attention_mask": enc["attention_mask"], "labels": labels}
 
 
