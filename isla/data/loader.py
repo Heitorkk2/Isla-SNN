@@ -18,7 +18,7 @@ from pathlib import Path
 from functools import partial
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 from datasets import load_from_disk, load_dataset, DatasetDict, Dataset as HFDataset
 from transformers import AutoTokenizer
 
@@ -35,8 +35,9 @@ def _tokenize_batch(examples, tokenizer, max_seq_len, is_finetune=False,
                     response_template="<|im_start|>assistant\n", pack=False):
     """Tokenize for causal LM.
 
-    Packed examples stay variable-length and receive one EOS boundary token.
-    Unpacked examples are padded to max_seq_len and mask padding with -100.
+    Examples stay variable-length in both modes; unpacked batches are padded
+    to the longest member at collation time, not to max_seq_len here. Packed
+    examples additionally receive one EOS boundary token.
     If is_finetune=True, also masks the human prompt with -100, leaving only assistant responses.
     """
     texts = examples.get("text") or examples.get("content")
@@ -45,8 +46,11 @@ def _tokenize_batch(examples, tokenizer, max_seq_len, is_finetune=False,
 
     eos_token_id = getattr(tokenizer, "eos_token_id", None)
     token_limit = max_seq_len - 1 if pack and eos_token_id is not None else max_seq_len
+    # Never pad here: fixed-width rows would bake <pad> into the cached dataset
+    # and force every batch to max_seq_len, which is quadratically expensive in
+    # the sync-attention kernel. _collate pads per batch instead.
     enc = tokenizer(texts, max_length=token_limit, truncation=True,
-                    padding=False if pack else "max_length", return_tensors=None)
+                    padding=False, return_tensors=None)
 
     if pack and eos_token_id is not None:
         for ids, attn in zip(enc["input_ids"], enc["attention_mask"]):
@@ -196,7 +200,9 @@ def load_isla_dataset(data_path, tokenizer, max_seq_len=1024, num_proc=4, pack=T
 
     # cached version next to source
     # v2 invalidates legacy packed caches that may contain padded input tokens.
-    cache_suffix = "_packed_v2" if pack else "_tokenized"
+    # _tokenized_v2 invalidates legacy caches whose rows were padded to
+    # max_seq_len; those would defeat the dynamic padding in _collate.
+    cache_suffix = "_packed_v2" if pack else "_tokenized_v2"
     cached = p.parent / f"{p.stem}{cache_suffix}"
     if cached.is_dir():
         print(f"[DATA] Found cache: {cached}")
@@ -237,25 +243,116 @@ def _to_long_tensor(val):
     return torch.tensor(list(val), dtype=torch.long)
 
 
-def _collate(batch):
-    ids = torch.stack([_to_long_tensor(b["input_ids"]) for b in batch])
-    if "labels" in batch[0]:
-        labels = torch.stack([_to_long_tensor(b["labels"]) for b in batch])
-    else:
-        labels = ids.clone()
-    return {"input_ids": ids, "labels": labels}
+def _collate(batch, pad_id=0, pad_to_multiple_of=64):
+    """Pad a batch to its own longest member instead of a global max length.
+
+    Rows already share a length when the dataset was packed, so this is a
+    no-op there. For instruction data it is the difference between attending
+    over 2048 positions and attending over ~256.
+    """
+    ids_list = [_to_long_tensor(b["input_ids"]) for b in batch]
+    has_labels = "labels" in batch[0]
+    labels_list = (
+        [_to_long_tensor(b["labels"]) for b in batch] if has_labels
+        else [t.clone() for t in ids_list]
+    )
+
+    max_len = max(t.numel() for t in ids_list)
+    if pad_to_multiple_of > 1:
+        # Round up so the attention matmuls stay on tensor-core-friendly shapes.
+        max_len = -(-max_len // pad_to_multiple_of) * pad_to_multiple_of
+
+    B = len(ids_list)
+    ids = torch.full((B, max_len), pad_id, dtype=torch.long)
+    labels = torch.full((B, max_len), -100, dtype=torch.long)
+    attention_mask = torch.zeros((B, max_len), dtype=torch.long)
+
+    for i, (row_ids, row_labels) in enumerate(zip(ids_list, labels_list)):
+        n = row_ids.numel()
+        ids[i, :n] = row_ids
+        labels[i, :n] = row_labels
+        attention_mask[i, :n] = 1
+
+    return {"input_ids": ids, "labels": labels, "attention_mask": attention_mask}
+
+
+class LengthGroupedSampler(Sampler):
+    """Yields indices so that each batch holds similarly-sized sequences.
+
+    Dynamic padding only pays off when a batch is homogeneous — one 2048-token
+    outlier drags its three short neighbours up with it. Shuffling inside large
+    megabatches keeps randomness while bounding the intra-batch length spread.
+    """
+
+    def __init__(self, lengths, batch_size, shuffle=True, seed=42, megabatch_mult=50):
+        self.lengths = list(lengths)
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.seed = seed
+        self.epoch = 0
+        self.megabatch_size = batch_size * megabatch_mult
+
+    def __len__(self):
+        return len(self.lengths)
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def __iter__(self):
+        n = len(self.lengths)
+        if self.shuffle:
+            g = torch.Generator()
+            g.manual_seed(self.seed + self.epoch)
+            order = torch.randperm(n, generator=g).tolist()
+        else:
+            order = list(range(n))
+
+        indices = []
+        for start in range(0, n, self.megabatch_size):
+            megabatch = order[start:start + self.megabatch_size]
+            megabatch.sort(key=lambda i: self.lengths[i], reverse=True)
+            indices.extend(megabatch)
+
+        if self.shuffle:
+            # Shuffle whole batches so the longest ones are not always first.
+            g = torch.Generator()
+            g.manual_seed(self.seed + self.epoch + 1)
+            batches = [indices[i:i + self.batch_size]
+                       for i in range(0, len(indices), self.batch_size)]
+            perm = torch.randperm(len(batches), generator=g).tolist()
+            indices = [i for b in perm for i in batches[b]]
+
+        return iter(indices)
 
 
 def create_dataloader(dataset_split, batch_size, shuffle=True, num_workers=2,
-                      drop_last=True, seed=42):
-    """Create a DataLoader with deterministic shuffling."""
+                      drop_last=True, seed=42, pad_id=0, group_by_length=False,
+                      pad_to_multiple_of=64):
+    """Create a DataLoader with dynamic padding and deterministic shuffling.
+
+    group_by_length sorts similar-length sequences into the same batch, which
+    cuts padding waste further on instruction datasets. It is ignored for
+    packed datasets, where every row already has the same length.
+    """
+    collate = partial(_collate, pad_id=pad_id, pad_to_multiple_of=pad_to_multiple_of)
+
+    sampler = None
+    if group_by_length:
+        lengths = [len(x) for x in dataset_split["input_ids"]]
+        if len(set(lengths)) == 1:
+            group_by_length = False  # packed data: grouping buys nothing
+        else:
+            sampler = LengthGroupedSampler(lengths, batch_size, shuffle, seed)
+
     generator = None
-    if shuffle:
+    if shuffle and sampler is None:
         generator = torch.Generator()
         generator.manual_seed(seed)
 
-    return DataLoader(dataset_split, batch_size=batch_size, shuffle=shuffle,
-                      collate_fn=_collate, num_workers=num_workers,
+    return DataLoader(dataset_split, batch_size=batch_size,
+                      shuffle=shuffle if sampler is None else False,
+                      sampler=sampler,
+                      collate_fn=collate, num_workers=num_workers,
                       pin_memory=torch.cuda.is_available(),
                       persistent_workers=num_workers > 0,
                       drop_last=drop_last, generator=generator)

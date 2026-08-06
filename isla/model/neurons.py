@@ -87,10 +87,15 @@ class LIFNeuron(nn.Module):
                      torch.relu(self.adaptation_strength) * spikes.detach()
         return spikes, membrane, adaptation
 
-    def multi_step(self, current, T, track_traces=False, stdp_decay_pre=None, stdp_decay_post=None):
+    def multi_step(self, current, T, track_traces=False, stdp_decay_pre=None,
+                   stdp_decay_post=None, valid_mask=None):
         """Integrate T timesteps with the same input current.
 
         Returns (spike_sum, final_membrane, mean_rate_per_unit).
+
+        valid_mask, shaped (B, L, 1), excludes padding positions from
+        mean_rate_per_unit. Without it the reported rate is diluted by
+        <pad> tokens, which biases the spike-rate regulariser.
 
         If track_traces=True, returns a 4th element: a dict with
         pre-accumulated STDP tensors ('ltp_accum', 'ltd_accum') of
@@ -143,7 +148,13 @@ class LIFNeuron(nn.Module):
                 ltd_accum = ltd_accum + geo_ltd[t] * s_det
 
         # per-unit rate averaged over batch and sequence dims (keep hidden dim)
-        rate_per_unit = spike_sum.mean(dim=tuple(range(spike_sum.ndim - 1))) / T
+        reduce_dims = tuple(range(spike_sum.ndim - 1))
+        if valid_mask is None:
+            rate_per_unit = spike_sum.mean(dim=reduce_dims) / T
+        else:
+            m = valid_mask.to(spike_sum.dtype)
+            n_valid = m.sum().clamp(min=1.0)
+            rate_per_unit = (spike_sum * m).sum(dim=reduce_dims) / (n_valid * T)
 
         if track_traces:
             stdp_data = {

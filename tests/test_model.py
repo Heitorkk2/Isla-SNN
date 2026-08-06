@@ -127,7 +127,7 @@ class TestModel:
                 return torch.zeros_like(x), cache
 
         class UnitMLP(torch.nn.Module):
-            def forward(self, x):
+            def forward(self, x, valid_mask=None):
                 return torch.ones_like(x), torch.zeros(x.shape[-1])
 
         block = SpikingBlock(_cfg(mlp_residual_mode="identity"))

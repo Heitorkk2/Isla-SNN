@@ -70,19 +70,21 @@ class SpikingMLP(nn.Module):
     def alpha(self):
         return torch.sigmoid(self.alpha_raw)
 
-    def forward(self, x):
+    def forward(self, x, valid_mask=None):
         h = self.up(x)
         if self._track_traces:
             spike_sum, membrane, rate_per_unit, stdp_data = self.lif.multi_step(
                 h, self.T, track_traces=True,
                 stdp_decay_pre=self._stdp_decay_pre,
                 stdp_decay_post=self._stdp_decay_post,
+                valid_mask=valid_mask,
             )
             self._stdp_pre = x.detach()            # (B, L, D_in)
             self._stdp_ltp_accum = stdp_data['ltp_accum']  # (B, L, D_ff) — compact!
             self._stdp_ltd_accum = stdp_data['ltd_accum']  # (B, L, D_ff)
         else:
-            spike_sum, membrane, rate_per_unit = self.lif.multi_step(h, self.T)
+            spike_sum, membrane, rate_per_unit = self.lif.multi_step(
+                h, self.T, valid_mask=valid_mask)
         rate = spike_sum / self.T
         # mix spike (binary) + alpha * membrane (continuous)
         mixed = rate + self.alpha * membrane.clamp(-1, 1)
@@ -125,11 +127,11 @@ class SpikingBlock(nn.Module):
     def gate(self):
         return torch.sigmoid(self.gate_raw)
 
-    def forward(self, h, mask=None, cache=None):
+    def forward(self, h, mask=None, cache=None, valid_mask=None):
         attn_out, cache = self.attn(self.attn_norm(h), mask, cache=cache)
         h = h + attn_out  # attention residual: kept
         h_pre = h
-        mlp_out, spike_rate = self.mlp(self.mlp_norm(h))
+        mlp_out, spike_rate = self.mlp(self.mlp_norm(h), valid_mask=valid_mask)
         if self.mlp_residual_mode == "identity":
             h = h_pre + self.gate * mlp_out
         else:
@@ -171,11 +173,14 @@ class IslaModel(nn.Module):
             elif isinstance(m, nn.Embedding):
                 nn.init.normal_(m.weight, std=0.02)
 
-    def forward(self, input_ids, caches: Optional[List[KVCache]] = None):
+    def forward(self, input_ids, attention_mask=None,
+                caches: Optional[List[KVCache]] = None):
         """
         Args:
-            input_ids: (B, L)
-            caches:    list of KVCache (one per layer), or None for training
+            input_ids:      (B, L)
+            attention_mask: (B, L_total) with 1 for real tokens and 0 for <pad>.
+                            None means every position is real.
+            caches:         list of KVCache (one per layer), or None for training
         Returns:
             logits:  (B, L, V)
             metrics: dict with mean_spike_rate, spike_rate_std, and per-layer rates
@@ -185,6 +190,11 @@ class IslaModel(nn.Module):
         use_cache = caches is not None
 
         h = self.emb_drop(self.token_emb(input_ids))
+
+        # (B, L, 1) gate so <pad> positions stay out of the spike-rate statistics
+        valid_mask = None
+        if attention_mask is not None:
+            valid_mask = attention_mask[:, -L:].to(h.dtype).unsqueeze(-1)
 
         # SSM causality is implicit in its recurrence. Avoiding a dense mask is
         # required for its memory usage to remain linear in sequence length.
@@ -199,14 +209,22 @@ class IslaModel(nn.Module):
                            dtype=h.dtype),
                 diagonal=1 + pos_offset,
             )
+            if attention_mask is not None:
+                # Broadcast the key-padding mask over query positions and heads:
+                # (B, L_total) → (B, 1, 1, L_total) added to (L, L_total).
+                key_pad = attention_mask[:, :L_total].to(h.dtype)
+                key_pad = (1.0 - key_pad) * torch.finfo(h.dtype).min
+                mask = mask.unsqueeze(0).unsqueeze(0) + key_pad[:, None, None, :]
 
         spike_rates = []
         for i, block in enumerate(self.blocks):
             layer_cache = caches[i] if use_cache else None
             if self._grad_ckpt and self.training:
-                h, rate, _ = ckpt_fn(block, h, mask, use_reentrant=False)
+                h, rate, _ = ckpt_fn(block, h, mask, None, valid_mask,
+                                     use_reentrant=False)
             else:
-                h, rate, layer_cache = block(h, mask, cache=layer_cache)
+                h, rate, layer_cache = block(h, mask, cache=layer_cache,
+                                             valid_mask=valid_mask)
                 if use_cache:
                     caches[i] = layer_cache
             spike_rates.append(rate)

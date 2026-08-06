@@ -224,9 +224,12 @@ class IslaTrainer:
     def _forward_backward(self, batch):
         ids = batch["input_ids"].to(self.device)
         labels = batch.get("labels", ids).to(self.device)
+        attn_mask = batch.get("attention_mask")
+        if attn_mask is not None:
+            attn_mask = attn_mask.to(self.device)
 
         with _get_amp_context(self.device, self.amp_dtype, self.use_amp):
-            logits, metrics, _ = self.model(ids)
+            logits, metrics, _ = self.model(ids, attention_mask=attn_mask)
             
             # Avoid contiguous() to save ~5GB VRAM on LM Head
             # We reshape to (B, Vocab, L-1) and labels to (B, L-1)
@@ -247,9 +250,9 @@ class IslaTrainer:
 
         self.scaler.scale(loss).backward()
 
-        # Count all processed tokens for accurate throughput (tok/s) metric,
-        # since the SNN still computes forward/backward passes for the entire sequence.
-        real_tokens = ids.numel()
+        # Count only non-padding tokens: with dynamic padding the padded share
+        # varies per batch, so ids.numel() would make tok/s look better than it is.
+        real_tokens = attn_mask.sum().item() if attn_mask is not None else ids.numel()
 
         return {"loss": ce.item(), "spike_rate": rate.item(),
                 "spike_rate_std": metrics["spike_rate_std"].item(),
@@ -320,8 +323,11 @@ class IslaTrainer:
                 break
             ids = batch["input_ids"].to(self.device)
             labels = batch["labels"].to(self.device)
+            attn_mask = batch.get("attention_mask")
+            if attn_mask is not None:
+                attn_mask = attn_mask.to(self.device)
             with _get_amp_context(self.device, self.amp_dtype, self.use_amp):
-                logits, metrics, _ = self.model(ids)
+                logits, metrics, _ = self.model(ids, attention_mask=attn_mask)
                 total_loss += self.criterion(
                     logits[:, :-1].transpose(1, 2),
                     labels[:, 1:],
