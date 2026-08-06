@@ -190,7 +190,6 @@ class StandardAttention(nn.Module):
         assert hidden_dim % num_heads == 0
         self.num_heads = num_heads
         self.head_dim = hidden_dim // num_heads
-        self.scale = self.head_dim ** -0.5
 
         self.q_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.k_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
@@ -217,11 +216,181 @@ class StandardAttention(nn.Module):
         if cache is not None:
             k, v = cache.update(k, v)
 
-        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        if mask is not None:
-            scores = scores + mask
-
-        weights = self.attn_drop(F.softmax(scores, dim=-1))
-        out = torch.matmul(weights, v)
+        # Dispatches to FlashAttention or another fused SDPA kernel when the
+        # current device, dtype, and mask support it.
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=mask,
+            dropout_p=self.attn_drop.p if self.training else 0.0,
+            is_causal=False,
+        )
         out = out.transpose(1, 2).contiguous().view(B, L, -1)
         return self.o_proj(out), cache
+
+
+# ---------- SSM Cache ---------- #
+
+class SSMCache:
+    """Recurrent state cache for SpikeStateSpaceAttention.
+
+    Instead of storing full K/V history (O(L) memory), stores a
+    compressed (d, d) state matrix per head — O(1) memory per layer.
+    """
+
+    def __init__(self):
+        self.state: Optional[torch.Tensor] = None   # (B, H, d, d)
+        self.norm: Optional[torch.Tensor] = None     # (B, H, d, 1)
+        self._seq_len: int = 0
+
+    @property
+    def seq_len(self):
+        return self._seq_len
+
+    def update(self, state_delta, norm_delta, decay):
+        """Accumulate new key-value into the recurrent state."""
+        if self.state is None:
+            self.state = state_delta
+            self.norm = norm_delta
+        else:
+            self.state = decay * self.state + state_delta
+            self.norm = decay * self.norm + norm_delta
+        self._seq_len += 1
+        return self.state, self.norm
+
+
+# ---------- Spike State Space Attention ---------- #
+
+class SpikeStateSpaceAttention(nn.Module):
+    """O(N) spike synchrony via recurrent state accumulation.
+
+    Replaces the O(N²) RBF kernel of SpikeSyncAttention with a
+    linear-time recurrent formulation that preserves spike timing
+    semantics:
+
+        state[t] = λ · state[t-1] + σ(K[t])ᵀ ⊗ V[t]
+        output[t] = σ(Q[t]) · state[t] / normalizer[t]
+
+    The sigmoid σ maps to [0,1] timing space (same as SpikeSyncAttention).
+    The decay λ acts as membrane leak — recent spikes matter more.
+
+    Training:  sequential scan over L positions (O(L·d²) per head)
+    Inference: true recurrent with SSMCache (O(d²) per step)
+
+    Same interface as SpikeSyncAttention for drop-in replacement.
+    """
+
+    def __init__(self, hidden_dim, num_heads, dropout=0.1,
+                 tau_init=1.0, max_seq_len=4096):
+        super().__init__()
+        assert hidden_dim % num_heads == 0
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+
+        self.q_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.k_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.v_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.o_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+
+        self.rotary = RotaryEmbedding(self.head_dim, max_seq_len)
+
+        # learnable decay per head: sigmoid keeps it in (0, 1)
+        # init near 0.95 for moderate memory retention
+        raw_init = torch.log(torch.tensor(0.95 / (1.0 - 0.95)))
+        self.decay_raw = nn.Parameter(
+            torch.full((num_heads, 1, 1), raw_init.item())
+        )
+
+        self.attn_drop = nn.Dropout(dropout)
+
+    @property
+    def decay(self):
+        """Per-head decay λ ∈ (0, 1)."""
+        return torch.sigmoid(self.decay_raw)
+
+    def forward(self, x, mask=None, cache: Optional[SSMCache] = None):
+        """
+        Args:
+            x:     (B, L, D) — full sequence or single new token
+            mask:  ignored (causality is implicit in the recurrence)
+            cache: SSMCache for incremental decoding (None during training)
+        Returns:
+            output: (B, L, D)
+            cache:  updated SSMCache (or None)
+        """
+        B, L, _ = x.shape
+        H, d = self.num_heads, self.head_dim
+
+        q = self.q_proj(x).view(B, L, H, d).transpose(1, 2)  # (B, H, L, d)
+        k = self.k_proj(x).view(B, L, H, d).transpose(1, 2)
+        v = self.v_proj(x).view(B, L, H, d).transpose(1, 2)
+
+        # RoPE before sigmoid (same as SpikeSyncAttention)
+        pos_offset = cache.seq_len if cache is not None else 0
+        cos, sin = self.rotary(L, offset=pos_offset)
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
+
+        # sigmoid timing mapping
+        qt = torch.sigmoid(q)  # (B, H, L, d)
+        kt = torch.sigmoid(k)
+
+        decay = self.decay  # (H, 1, 1)
+
+        if cache is not None:
+            if L > 1:
+                # Prefill: sequential scan over L tokens, then update cache
+                state = cache.state if cache.state is not None else torch.zeros(B, H, d, d, device=x.device, dtype=x.dtype)
+                norm_state = cache.norm if cache.norm is not None else torch.zeros(B, H, d, 1, device=x.device, dtype=x.dtype)
+                outputs = []
+
+                for t in range(L):
+                    k_t = kt[:, :, t:t+1, :]              # (B, H, 1, d)
+                    v_t = v[:, :, t:t+1, :]                # (B, H, 1, d)
+                    k_col = k_t.transpose(-1, -2)          # (B, H, d, 1)
+
+                    state = decay * state + k_col @ v_t    # (B, H, d, d)
+                    norm_state = decay * norm_state + k_col # (B, H, d, 1)
+
+                    q_t = qt[:, :, t:t+1, :]               # (B, H, 1, d)
+                    o_t = q_t @ state                       # (B, H, 1, d)
+                    n_t = q_t @ norm_state + 1e-6           # (B, H, 1, 1)
+                    outputs.append(o_t / n_t)
+
+                cache.state = state
+                cache.norm = norm_state
+                cache._seq_len += L
+
+                out = self.attn_drop(torch.cat(outputs, dim=2))  # (B, H, L, d)
+            else:
+                # Inference: single-token recurrent update (L == 1)
+                k_col = kt.transpose(-1, -2)       # (B, H, d, 1)
+                kv = k_col @ v                     # (B, H, d, d)
+                state, norm = cache.update(kv, k_col, decay)
+
+                out = qt @ state                    # (B, H, 1, d)
+                denom = qt @ norm + 1e-6            # (B, H, 1, 1)
+                out = self.attn_drop(out / denom)
+        else:
+            # Training: sequential scan (O(L·d²) per head)
+            state = torch.zeros(B, H, d, d, device=x.device, dtype=x.dtype)
+            norm_state = torch.zeros(B, H, d, 1, device=x.device, dtype=x.dtype)
+            outputs = []
+
+            for t in range(L):
+                k_t = kt[:, :, t:t+1, :]              # (B, H, 1, d)
+                v_t = v[:, :, t:t+1, :]                # (B, H, 1, d)
+                k_col = k_t.transpose(-1, -2)          # (B, H, d, 1)
+
+                state = decay * state + k_col @ v_t    # (B, H, d, d)
+                norm_state = decay * norm_state + k_col # (B, H, d, 1)
+
+                q_t = qt[:, :, t:t+1, :]               # (B, H, 1, d)
+                o_t = q_t @ state                       # (B, H, 1, d)
+                n_t = q_t @ norm_state + 1e-6           # (B, H, 1, 1)
+                outputs.append(o_t / n_t)
+
+            out = self.attn_drop(torch.cat(outputs, dim=2))  # (B, H, L, d)
+
+        out = out.transpose(1, 2).contiguous().view(B, L, -1)
+        return self.o_proj(out), cache
+

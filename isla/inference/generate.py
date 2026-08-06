@@ -6,7 +6,7 @@ generate_stream() → yields token strings one-by-one (for real-time UIs)
 
 import torch
 import torch.nn.functional as F
-from isla.model.attention import KVCache
+from isla.model.attention import KVCache, SSMCache
 
 
 def _filter_logits(logits, top_k=0, top_p=0.0):
@@ -46,6 +46,12 @@ def _sample_next(logits, generated_ids, temperature, top_k, top_p, repetition_pe
     return torch.multinomial(F.softmax(nxt, dim=-1), 1)
 
 
+def _create_caches(model):
+    """Create the correct cache type based on model attention variant."""
+    cache_cls = SSMCache if getattr(model.config, 'use_spike_ssm', False) else KVCache
+    return [cache_cls() for _ in range(model.config.num_layers)]
+
+
 @torch.no_grad()
 def generate_stream(model, tokenizer, prompt, max_new_tokens=100, temperature=0.8,
                     top_k=40, top_p=0.9, repetition_penalty=1.1, device="cpu",
@@ -64,7 +70,7 @@ def generate_stream(model, tokenizer, prompt, max_new_tokens=100, temperature=0.
     generated = ids
     prev_text = tokenizer.decode(ids[0], skip_special_tokens=True)
 
-    caches = [KVCache() for _ in range(model.config.num_layers)] if use_cache else None
+    caches = _create_caches(model) if use_cache else None
     logits, _, caches = model(ids, caches=caches)
 
     for _ in range(max_new_tokens):

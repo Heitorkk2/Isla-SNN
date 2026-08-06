@@ -35,7 +35,7 @@ spike_fn(v, threshold=0.0).sum().backward()
 check("surrogate gradient flows", v.grad is not None and (v.grad != 0).any())
 
 lif = LIFNeuron(32)
-s, m = lif.step(torch.randn(4, 32))
+s, m, _ = lif.step(torch.randn(4, 32))
 check("LIF shapes", s.shape == (4, 32) and m.shape == (4, 32))
 check("beta in (0,1)", (lif.beta > 0).all() and (lif.beta < 1).all())
 

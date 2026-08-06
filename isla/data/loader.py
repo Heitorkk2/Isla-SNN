@@ -31,16 +31,28 @@ def get_tokenizer(name="codelion/gpt-2-70m"):
     return tok
 
 
-def _tokenize_batch(examples, tokenizer, max_seq_len, is_finetune=False, response_template="<|im_start|>assistant\n"):
-    """Tokenize for causal LM. Pads to max_seq_len, labels mask padding with -100.
+def _tokenize_batch(examples, tokenizer, max_seq_len, is_finetune=False,
+                    response_template="<|im_start|>assistant\n", pack=False):
+    """Tokenize for causal LM.
+
+    Packed examples stay variable-length and receive one EOS boundary token.
+    Unpacked examples are padded to max_seq_len and mask padding with -100.
     If is_finetune=True, also masks the human prompt with -100, leaving only assistant responses.
     """
     texts = examples.get("text") or examples.get("content")
     if texts is None:
         raise ValueError(f"No text column. Available: {list(examples.keys())}")
 
-    enc = tokenizer(texts, max_length=max_seq_len, truncation=True,
-                    padding="max_length", return_tensors=None)
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    token_limit = max_seq_len - 1 if pack and eos_token_id is not None else max_seq_len
+    enc = tokenizer(texts, max_length=token_limit, truncation=True,
+                    padding=False if pack else "max_length", return_tensors=None)
+
+    if pack and eos_token_id is not None:
+        for ids, attn in zip(enc["input_ids"], enc["attention_mask"]):
+            if not ids or ids[-1] != eos_token_id:
+                ids.append(eos_token_id)
+                attn.append(1)
 
     labels = []
     
@@ -87,13 +99,19 @@ def _pack_sequences(dataset, max_seq_len):
     all_ids = []
     all_labels = []
     has_labels = "labels" in dataset.column_names
+    has_attention_mask = "attention_mask" in dataset.column_names
 
     for example in dataset:
-        ids = example["input_ids"]
-        all_ids.extend(list(ids) if not isinstance(ids, list) else ids)
+        ids = list(example["input_ids"])
+        labels = list(example["labels"]) if has_labels else ids
+        if has_attention_mask:
+            keep = [bool(value) for value in example["attention_mask"]]
+            ids = [token for token, active in zip(ids, keep) if active]
+            labels = [label for label, active in zip(labels, keep) if active]
+
+        all_ids.extend(ids)
         if has_labels:
-            lbls = example["labels"]
-            all_labels.extend(list(lbls) if not isinstance(lbls, list) else lbls)
+            all_labels.extend(labels)
 
 
     # chunk into blocks of max_seq_len (discard remainder)
@@ -126,6 +144,8 @@ def _ensure_dict_with_split(dataset, validation_split=0.001):
 
     # create validation split if missing
     if "validation" not in dataset and "test" not in dataset:
+        if validation_split == 0:
+            return dataset
         n_val = max(1, int(len(dataset["train"]) * validation_split))
         split = dataset["train"].train_test_split(test_size=n_val, shuffle=True, seed=42)
         dataset = DatasetDict({"train": split["train"], "validation": split["test"]})
@@ -138,8 +158,9 @@ def _ensure_dict_with_split(dataset, validation_split=0.001):
     return dataset
 
 
-def load_isla_dataset(data_path, tokenizer, max_seq_len=1024, num_proc=4, pack=True, 
-                      is_finetune=False, response_template="<|im_start|>assistant\n"):
+def load_isla_dataset(data_path, tokenizer, max_seq_len=1024, num_proc=4, pack=True,
+                      is_finetune=False, response_template="<|im_start|>assistant\n",
+                      validation_split=0.001):
     """Load (and optionally tokenize + cache) a dataset.
 
     Args:
@@ -150,6 +171,7 @@ def load_isla_dataset(data_path, tokenizer, max_seq_len=1024, num_proc=4, pack=T
         pack: if True, concatenate and chunk (no padding waste)
         is_finetune: if True, masks the user prompts with -100
         response_template: identifying tag for the assistant block
+        validation_split: fraction reserved when the dataset has no validation split
     """
     p = Path(data_path)
 
@@ -157,13 +179,13 @@ def load_isla_dataset(data_path, tokenizer, max_seq_len=1024, num_proc=4, pack=T
     if p.is_dir():
         print(f"[DATA] Loading pre-tokenized dataset: {p}")
         ds = load_from_disk(str(p))
-        ds = _ensure_dict_with_split(ds)
+        ds = _ensure_dict_with_split(ds, validation_split)
 
         # optionally re-pack pre-tokenized data
         if pack and "labels" not in ds["train"].column_names:
             print("[DATA] Re-packing pre-tokenized dataset (no labels column, packing from input_ids)")
             packed = _pack_sequences(ds["train"], max_seq_len)
-            ds = _ensure_dict_with_split(packed)
+            ds = _ensure_dict_with_split(packed, validation_split)
 
         cols = ds["train"].column_names
         has_labels = "labels" in cols
@@ -173,12 +195,13 @@ def load_isla_dataset(data_path, tokenizer, max_seq_len=1024, num_proc=4, pack=T
         return ds
 
     # cached version next to source
-    cache_suffix = "_packed" if pack else "_tokenized"
+    # v2 invalidates legacy packed caches that may contain padded input tokens.
+    cache_suffix = "_packed_v2" if pack else "_tokenized"
     cached = p.parent / f"{p.stem}{cache_suffix}"
     if cached.is_dir():
         print(f"[DATA] Found cache: {cached}")
         ds = load_from_disk(str(cached))
-        ds = _ensure_dict_with_split(ds)
+        ds = _ensure_dict_with_split(ds, validation_split)
         return ds
 
     # need to tokenize
@@ -190,16 +213,17 @@ def load_isla_dataset(data_path, tokenizer, max_seq_len=1024, num_proc=4, pack=T
         raw = load_dataset(data_path)
 
     fn = partial(_tokenize_batch, tokenizer=tokenizer, max_seq_len=max_seq_len, 
-                 is_finetune=is_finetune, response_template=response_template)
+                 is_finetune=is_finetune, response_template=response_template,
+                 pack=pack)
     tok_ds = raw.map(fn, batched=True, remove_columns=raw["train"].column_names,
                      num_proc=num_proc, desc="Tokenizing")
 
     if pack:
         # pack after tokenization: concatenate + chunk for zero-waste training
         packed_train = _pack_sequences(tok_ds["train"], max_seq_len)
-        tok_ds = _ensure_dict_with_split(packed_train)
+        tok_ds = _ensure_dict_with_split(packed_train, validation_split)
     else:
-        tok_ds = _ensure_dict_with_split(tok_ds)
+        tok_ds = _ensure_dict_with_split(tok_ds, validation_split)
 
     tok_ds.save_to_disk(str(cached))
     print(f"[DATA] Cached at: {cached}")
@@ -232,4 +256,6 @@ def create_dataloader(dataset_split, batch_size, shuffle=True, num_workers=2,
 
     return DataLoader(dataset_split, batch_size=batch_size, shuffle=shuffle,
                       collate_fn=_collate, num_workers=num_workers,
-                      pin_memory=True, drop_last=drop_last, generator=generator)
+                      pin_memory=torch.cuda.is_available(),
+                      persistent_workers=num_workers > 0,
+                      drop_last=drop_last, generator=generator)

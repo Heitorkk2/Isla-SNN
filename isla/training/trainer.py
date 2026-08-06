@@ -58,6 +58,34 @@ class IslaTrainer:
         self.cfg = train_cfg
         self.model_cfg = model_cfg
         self.device = next(model.parameters()).device
+        
+        # apply surrogate slope from config to all neurons
+        slope_count = 0
+        for m in model.modules():
+            if hasattr(m, "slope"):
+                m.slope = self.cfg.surrogate_slope
+                slope_count += 1
+        if slope_count > 0:
+            print(f"[TRAIN] injected surrogate_slope={self.cfg.surrogate_slope} into {slope_count} modules")
+
+        # R-STDP: hybrid biological learning for spiking MLP layers
+        self._stdp = None
+        if self.cfg.use_rstdp:
+            from isla.training.stdp import RSTDPRule
+            self._stdp = RSTDPRule(
+                lr=self.cfg.rstdp_lr,
+                tau_plus=self.cfg.rstdp_tau_plus,
+                tau_minus=self.cfg.rstdp_tau_minus,
+                a_plus=self.cfg.rstdp_a_plus,
+                a_minus=self.cfg.rstdp_a_minus,
+            )
+            # enable trace tracking on all SpikingMLP modules
+            for m in model.modules():
+                if hasattr(m, '_track_traces'):
+                    m._track_traces = True
+                    m._stdp_decay_pre = self._stdp.decay_pre
+                    m._stdp_decay_post = self._stdp.decay_post
+            print(f"[TRAIN] R-STDP enabled (lr={self.cfg.rstdp_lr})")
 
         # keep reference to the unwrapped model (torch.compile wraps it)
         self._raw_model = getattr(model, "_orig_mod", model)
@@ -155,6 +183,25 @@ class IslaTrainer:
             pg["lr"] = lr
         return lr
 
+    def _update_surrogate_slope(self):
+        if getattr(self.cfg, "surrogate_slope_final", None) is None:
+            return self.cfg.surrogate_slope
+        
+        init = self.cfg.surrogate_slope
+        final = self.cfg.surrogate_slope_final
+        
+        # Cosine scheduling from init to final
+        progress = self.step / max(self.cfg.max_steps, 1)
+        progress = min(max(progress, 0.0), 1.0)
+        
+        slope = final + 0.5 * (init - final) * (1.0 + math.cos(math.pi * progress))
+        
+        # Update slope of all modules that have it
+        for m in self.model.modules():
+            if hasattr(m, "slope"):
+                m.slope = slope
+        return slope
+
     def _resume(self, ckpt_dir):
         """Restore model weights, optimizer state, scaler, and step counter."""
         d = Path(ckpt_dir)
@@ -200,8 +247,9 @@ class IslaTrainer:
 
         self.scaler.scale(loss).backward()
 
-        # count real tokens (excluding padding / -100 labels)
-        real_tokens = (labels != -100).sum().item()
+        # Count all processed tokens for accurate throughput (tok/s) metric,
+        # since the SNN still computes forward/backward passes for the entire sequence.
+        real_tokens = ids.numel()
 
         return {"loss": ce.item(), "spike_rate": rate.item(),
                 "spike_rate_std": metrics["spike_rate_std"].item(),
@@ -298,7 +346,7 @@ class IslaTrainer:
 
     def train(self, train_loader, val_loader=None):
         self.model.train()
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
         t0 = time.time()
 
         eff = self.cfg.effective_batch_size
@@ -322,6 +370,7 @@ class IslaTrainer:
         try:
             while self.step < self.cfg.max_steps:
                 lr = self._update_lr()
+                slope = self._update_surrogate_slope()
                 acc = {"loss": 0.0, "spike_rate": 0.0, "spike_rate_std": 0.0, "real_tokens": 0}
 
                 for _ in range(self.cfg.gradient_accumulation_steps):
@@ -343,7 +392,12 @@ class IslaTrainer:
                 grad_norm = nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.max_grad_norm).item()
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
-                self.optimizer.zero_grad()
+                self.optimizer.zero_grad(set_to_none=True)
+
+                # R-STDP: apply biological weight updates ONCE per optimizer step
+                if self._stdp is not None:
+                    reward = -acc["loss"]  # lower loss = higher reward
+                    self._stdp.apply_to_model(self._raw_model, reward)
 
                 self.step += 1
                 self.tokens_seen += acc["real_tokens"]
@@ -362,6 +416,7 @@ class IslaTrainer:
                         "spike_rate_std": round(acc["spike_rate_std"], 4),
                         "grad_norm": round(grad_norm, 4),
                         "lr": round(lr, 8), "tokens_per_sec": round(tps, 1),
+                        "surrogate_slope": round(slope, 4),
                     }
                     self._log(entry)
                     self._wandb_log({
@@ -372,6 +427,7 @@ class IslaTrainer:
                         "train/spike_rate_std": acc["spike_rate_std"],
                         "train/grad_norm": grad_norm,
                         "train/lr": lr,
+                        "train/surrogate_slope": slope,
                         "train/tokens_per_sec": tps,
                         "train/tokens_seen": self.tokens_seen,
                         **self._collect_diagnostics(),

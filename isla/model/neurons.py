@@ -21,7 +21,7 @@ import torch
 import torch.nn as nn
 
 
-def spike_fn(membrane, threshold=1.0, slope=25.0):
+def spike_fn(membrane, threshold=1.0, slope=5.0):
     """Differentiable spike function via surrogate gradient.
     Implemented purely in PyTorch (Straight-Through Estimator).
     This bypasses torch.autograd.Function entirely, preventing
@@ -47,12 +47,15 @@ class LIFNeuron(nn.Module):
       forcing diverse neuronal activity. Controlled by learnable
       adaptation_strength (decays at fixed rate adaptation_decay).
     - multi_step returns final_membrane for use as continuous feature.
+    - Online STDP accumulation: when track_traces=True, pre-computes
+      weighted spike sums for LTP/LTD inline, avoiding storage of the
+      full (T, B, L, D_ff) spike history tensor.
 
     The decay β is parameterised as sigmoid(raw) so it stays in (0, 1)
     without explicit clamping, and gradients flow freely.
     """
 
-    def __init__(self, dim, beta=0.9, threshold=1.0, slope=25.0,
+    def __init__(self, dim, beta=0.9, threshold=1.0, slope=5.0,
                  adaptation_decay=0.9):
         super().__init__()
         self.base_threshold = threshold
@@ -84,10 +87,17 @@ class LIFNeuron(nn.Module):
                      torch.relu(self.adaptation_strength) * spikes.detach()
         return spikes, membrane, adaptation
 
-    def multi_step(self, current, T):
+    def multi_step(self, current, T, track_traces=False, stdp_decay_pre=None, stdp_decay_post=None):
         """Integrate T timesteps with the same input current.
 
         Returns (spike_sum, final_membrane, mean_rate_per_unit).
+
+        If track_traces=True, returns a 4th element: a dict with
+        pre-accumulated STDP tensors ('ltp_accum', 'ltd_accum') of
+        shape (*input_shape) — NOT the full (T, *) spike history.
+        This cuts STDP memory usage by ~(T-2)/T compared to storing
+        the complete spike_history tensor.
+
         final_membrane is exposed so SpikingMLP can use it as a
         continuous feature alongside binary spikes (v3 improvement).
         """
@@ -96,7 +106,29 @@ class LIFNeuron(nn.Module):
         adaptation = torch.zeros_like(current)
         spike_sum = torch.zeros_like(current)
 
-        for _ in range(T):
+        # Online STDP accumulators (only allocated when needed)
+        if track_traces:
+            ltp_accum = torch.zeros_like(current)
+            ltd_accum = torch.zeros_like(current)
+            # Pre-compute geometric weights for all T timesteps
+            device, dtype = current.device, current.dtype
+            # LTP weights: geo[t] = cumsum of [1, decay_pre, decay_pre², ...]
+            dp = stdp_decay_pre if stdp_decay_pre is not None else 0.95
+            dq = stdp_decay_post if stdp_decay_post is not None else 0.95
+            geo_ltp = torch.zeros(T, device=device, dtype=dtype)
+            geo_ltd = torch.zeros(T, device=device, dtype=dtype)
+            cumsum = 0.0
+            for t in range(T):
+                cumsum += dp ** t
+                geo_ltp[t] = cumsum
+            # LTD weights: reversed geometric of post decay
+            cumsum = 0.0
+            for t in range(T):
+                cumsum += dq ** t
+                geo_ltd[t] = cumsum
+            geo_ltd = geo_ltd.flip(0)
+
+        for t in range(T):
             threshold = self.base_threshold + adaptation
             membrane = beta * membrane + current
             spikes = spike_fn(membrane, threshold, self.slope)
@@ -105,8 +137,20 @@ class LIFNeuron(nn.Module):
                          torch.relu(self.adaptation_strength) * spikes.detach()
             spike_sum = spike_sum + spikes
 
+            if track_traces:
+                s_det = spikes.detach()
+                ltp_accum = ltp_accum + geo_ltp[t] * s_det
+                ltd_accum = ltd_accum + geo_ltd[t] * s_det
+
         # per-unit rate averaged over batch and sequence dims (keep hidden dim)
         rate_per_unit = spike_sum.mean(dim=tuple(range(spike_sum.ndim - 1))) / T
+
+        if track_traces:
+            stdp_data = {
+                'ltp_accum': ltp_accum.detach(),  # (B, L, D_ff)
+                'ltd_accum': ltd_accum.detach(),   # (B, L, D_ff)
+            }
+            return spike_sum, membrane, rate_per_unit, stdp_data
         return spike_sum, membrane, rate_per_unit
 
     def forward(self, currents):

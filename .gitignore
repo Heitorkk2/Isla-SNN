@@ -35,7 +35,7 @@ desktop.ini
 
 # Jupyter
 .ipynb_checkpoints/
-
+experiments/
 # W&B
 wandb/
 

@@ -13,11 +13,12 @@
   "spike_reg_lambda": 0.05,
   "target_spike_rate": 0.3,
   "use_standard_attention": false,
+  "mlp_residual_mode": "identity",
   "compile": false,
   "tokenizer_name": "Polygl0t/Tucano2-qwen-3.7B-Base",
-  "_note": "v3: 150M params | Learnable gated residual | 8 timesteps | 2048 ctx | Trilingual EN/PT/Code dataset",
+  "_note": "150M params | Identity-preserving gated residual | 8 timesteps | 2048 ctx | Trilingual EN/PT/Code dataset",
   "_improvements": [
-    "Gated residual (learns spike vs direct balance)",
+    "Identity-preserving gated residual",
     "8 timesteps (2x more temporal information)",
     "2048 context (2x longer)",
     "3x more parameters (768d x 12L)"

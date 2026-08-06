@@ -12,10 +12,12 @@ Isla explores a different path for neural attention: instead of dot-product simi
 
 - **Spike synchrony attention** — a novel RBF-kernel attention based on spike timing similarity
 - **LIF neurons** — Leaky Integrate-and-Fire with learnable per-unit decay and vectorised multi-step
+- **Stable gated residuals** — identity-preserving MLP residual with legacy checkpoint compatibility
+- **Surrogate Gradient Control** — adjustable gradient steepness (slope) for stable and flexible learning
 - **Rotary Position Embeddings** — RoPE applied before timing mapping for clean positional encoding
 - **Simple API** — `isla.train()`, `isla.generate()`, `isla.load_model()`
 - **Fast inference** — KV cache + streaming generation
-- **Token packing** — zero-waste concatenate-and-chunk for efficient pre-training
+- **Token packing** — zero-waste concatenate-and-chunk for efficient training
 
 ## Quick Start
 
@@ -80,7 +82,7 @@ Isla-SNN/
 │   ├── model/
 │   │   ├── neurons.py             # LIF neuron + SFA + surrogate gradient
 │   │   ├── attention.py           # spike sync attention + RoPE + KV cache
-│   │   └── architecture.py        # IslaModel, SpikingBlock, gated residual
+│   │   └── architecture.py        # IslaModel, SpikingBlock, identity-preserving gated residual
 │   ├── data/
 │   │   └── loader.py              # HF datasets + tokenizer + packing + caching
 │   ├── training/
@@ -131,6 +133,8 @@ Each neuron has a learnable decay `β ∈ (0,1)`. The output is the mean spike r
 
 **Token packing** concatenates all tokenized texts and re-chunks them into fixed-length blocks. This eliminates padding waste, typically yielding 2-5× more effective training tokens per batch compared to padding-based approaches.
 
+New models use an identity-preserving gated MLP residual, `h = h + gate · mlp(h)`, which keeps a clean gradient path through deep stacks. Checkpoints created with the earlier spike-first residual are detected while loading and retain their original behavior.
+
 ## Training Features
 
 | Feature | Detail |
@@ -142,6 +146,7 @@ Each neuron has a learnable decay `β ∈ (0,1)`. The output is the mean spike r
 | Data | Token packing (zero-waste) or padding (fallback) |
 | Fine-Tuning | Native instruction prompt-masking (`-100` label suppression via `response_template`) |
 | Positions | Rotary Position Embeddings (RoPE) |
+| Slope | Configurable Surrogate Gradient slope via `TrainConfig` |
 | Logging | JSONL + W&B (optional), single-line progress bar |
 | Diagnostics | τ, β per layer, spike rates ± std, dead/saturated neuron %, grad norm |
 | Checkpoints | Periodic (`step_N/`), best model (`best/`), latest (`latest/`), final (`final/`) |
@@ -173,19 +178,6 @@ tokenizers>=0.13.0
 pip install -q pandas matplotlib wandb
 pip install git+https://github.com/EleutherAI/lm-evaluation-harness.git
 ```
-
-## Data Acknowledgements
-
-The Isla-SNN pre-training dataset (~1B tokens) is composed of:
-
-| Source | Weight | License |
-|--------|--------|---------|
-| [FineWeb-Edu 1B](https://huggingface.co/datasets/codelion/fineweb-edu-1B) (English) | 60% | ODC-By 1.0 |
-| [Portuguese-PD](https://huggingface.co/datasets/PleIAs/Portuguese-PD) (PT-BR) | 30% | Public Domain |
-| [instruct-python-500k](https://huggingface.co/datasets/luisroque/instruct-python-500k) (Code) | 5% | CC-BY-SA 3.0 |
-| [NuminaMath-CoT](https://huggingface.co/datasets/AI-MO/NuminaMath-CoT) (Math) | 5% | CC-BY 4.0 |
-
-Tokenized with [Tucano2-qwen-3.7B](https://huggingface.co/Polygl0t/Tucano2-qwen-3.7B-Base) tokenizer (49k vocab, 2048 seq length).
 
 ## References
 

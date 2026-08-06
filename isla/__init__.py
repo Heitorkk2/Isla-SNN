@@ -54,7 +54,8 @@ def train(
                                 data_config.max_seq_len, data_config.num_proc,
                                 pack=data_config.pack_sequences,
                                 is_finetune=data_config.is_finetune,
-                                response_template=data_config.response_template)
+                                response_template=data_config.response_template,
+                                validation_split=data_config.validation_split)
 
     train_dl = create_dataloader(dataset["train"], train_config.batch_size,
                                  shuffle=True, num_workers=data_config.num_workers,

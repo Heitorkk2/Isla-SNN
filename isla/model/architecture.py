@@ -24,7 +24,7 @@ from torch.utils.checkpoint import checkpoint as ckpt_fn
 
 from isla.config import ModelConfig
 from .neurons import LIFNeuron
-from .attention import SpikeSyncAttention, StandardAttention, KVCache
+from .attention import SpikeSyncAttention, SpikeStateSpaceAttention, StandardAttention, KVCache, SSMCache
 
 
 class RMSNorm(nn.Module):
@@ -61,6 +61,10 @@ class SpikingMLP(nn.Module):
         # learnable membrane mixing coefficient
         # sigmoid keeps it in (0,1); init at -2 → sigmoid(-2) ≈ 0.12 (subtle start)
         self.alpha_raw = nn.Parameter(torch.full((1,), -2.0))
+        # R-STDP: set to True by trainer to enable spike trace storage
+        self._track_traces = False
+        self._stdp_decay_pre = 0.95   # overridden by trainer when R-STDP active
+        self._stdp_decay_post = 0.95  # overridden by trainer when R-STDP active
 
     @property
     def alpha(self):
@@ -68,7 +72,17 @@ class SpikingMLP(nn.Module):
 
     def forward(self, x):
         h = self.up(x)
-        spike_sum, membrane, rate_per_unit = self.lif.multi_step(h, self.T)
+        if self._track_traces:
+            spike_sum, membrane, rate_per_unit, stdp_data = self.lif.multi_step(
+                h, self.T, track_traces=True,
+                stdp_decay_pre=self._stdp_decay_pre,
+                stdp_decay_post=self._stdp_decay_post,
+            )
+            self._stdp_pre = x.detach()            # (B, L, D_in)
+            self._stdp_ltp_accum = stdp_data['ltp_accum']  # (B, L, D_ff) — compact!
+            self._stdp_ltd_accum = stdp_data['ltd_accum']  # (B, L, D_ff)
+        else:
+            spike_sum, membrane, rate_per_unit = self.lif.multi_step(h, self.T)
         rate = spike_sum / self.T
         # mix spike (binary) + alpha * membrane (continuous)
         mixed = rate + self.alpha * membrane.clamp(-1, 1)
@@ -79,17 +93,23 @@ class SpikingMLP(nn.Module):
 class SpikingBlock(nn.Module):
     """Pre-norm residual block with spike-synchrony attention and spiking MLP.
 
-    v3: Safe additive gated residual. Spikes ALWAYS flow (never bypassed).
-    An optional learned gate adds a residual boost on top:
-        h = spike_out + gate * h_pre
-    gate=0 → pure spike (v2). gate>0 → spike + boost.
-    The gate can NEVER kill spikes, it only enhances them.
+    New models preserve the identity path and gate the transformed branch:
+        h = h_pre + gate * spike_out
+
+    Legacy checkpoints keep the original spike-first topology through
+    config.mlp_residual_mode="spike_first".
     """
 
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.attn_norm = RMSNorm(config.hidden_dim)
-        attn_cls = StandardAttention if config.use_standard_attention else SpikeSyncAttention
+        if config.use_standard_attention:
+            attn_cls = StandardAttention
+        elif config.use_spike_ssm:
+            attn_cls = SpikeStateSpaceAttention
+        else:
+            attn_cls = SpikeSyncAttention
+            
         self.attn = attn_cls(
             config.hidden_dim, config.num_heads,
             config.dropout, config.sync_tau_init,
@@ -97,7 +117,8 @@ class SpikingBlock(nn.Module):
         )
         self.mlp_norm = RMSNorm(config.hidden_dim)
         self.mlp = SpikingMLP(config)
-        # additive gate: sigmoid(-2) ≈ 0.12 at init — subtle residual boost
+        self.mlp_residual_mode = config.mlp_residual_mode
+        # sigmoid(-2) ≈ 0.12: introduce the transformed branch gradually
         self.gate_raw = nn.Parameter(torch.full((1,), -2.0))
 
     @property
@@ -107,10 +128,13 @@ class SpikingBlock(nn.Module):
     def forward(self, h, mask=None, cache=None):
         attn_out, cache = self.attn(self.attn_norm(h), mask, cache=cache)
         h = h + attn_out  # attention residual: kept
-        h_pre = h  # save for residual boost
+        h_pre = h
         mlp_out, spike_rate = self.mlp(self.mlp_norm(h))
-        # safe additive gate: spikes always active + optional residual boost
-        h = mlp_out + self.gate * h_pre
+        if self.mlp_residual_mode == "identity":
+            h = h_pre + self.gate * mlp_out
+        else:
+            # Exact v3 behaviour for backward-compatible checkpoint loading.
+            h = mlp_out + self.gate * h_pre
         return h, spike_rate, cache
 
 
@@ -162,13 +186,19 @@ class IslaModel(nn.Module):
 
         h = self.emb_drop(self.token_emb(input_ids))
 
-        # causal mask generated on-the-fly (no persistent O(L²) buffer)
-        pos_offset = caches[0].seq_len if use_cache else 0
-        L_total = pos_offset + L
-        mask = torch.triu(
-            torch.full((L, L_total), float("-inf"), device=input_ids.device),
-            diagonal=1 + pos_offset,
-        )
+        # SSM causality is implicit in its recurrence. Avoiding a dense mask is
+        # required for its memory usage to remain linear in sequence length.
+        if self.config.use_spike_ssm:
+            mask = None
+        else:
+            # Generated on-the-fly (no persistent O(L²) buffer).
+            pos_offset = caches[0].seq_len if use_cache else 0
+            L_total = pos_offset + L
+            mask = torch.triu(
+                torch.full((L, L_total), float("-inf"), device=input_ids.device,
+                           dtype=h.dtype),
+                diagonal=1 + pos_offset,
+            )
 
         spike_rates = []
         for i, block in enumerate(self.blocks):

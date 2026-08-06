@@ -6,6 +6,7 @@ The API mirrors HuggingFace conventions so checkpoints are self-contained.
 
 import json
 import warnings
+from typing import Optional
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
@@ -26,7 +27,7 @@ class ModelConfig:
     # LIF neuron parameters
     beta_init: float = 0.9         # membrane decay β₀ (learnable, constrained to (0,1))
     threshold: float = 1.0         # spike threshold θ
-    surrogate_slope: float = 25.0  # steepness k of the surrogate gradient
+    surrogate_slope: float = 5.0   # steepness k of the surrogate gradient (v3: lowered for better training)
 
     # spike synchrony attention
     sync_tau_init: float = 1.0     # initial temperature τ₀ for the RBF kernel
@@ -37,6 +38,12 @@ class ModelConfig:
 
     # ablation
     use_standard_attention: bool = False  # swap sync attention for dot-product
+    use_spike_ssm: bool = False          # swap sync attention for O(N) state space
+
+    # residual topology
+    # identity: h = h + gate * mlp(h), stable pre-norm Transformer residual
+    # spike_first: h = mlp(h) + gate * h, legacy v3 checkpoint behaviour
+    mlp_residual_mode: str = "identity"
 
     # speed
     compile: bool = False  # torch.compile() the model
@@ -47,15 +54,35 @@ class ModelConfig:
     # metadata (not used by the model, but stored for reproducibility)
     tokenizer_name: str = "codelion/gpt-2-70m"
 
+    def __post_init__(self):
+        if self.hidden_dim <= 0 or self.num_heads <= 0:
+            raise ValueError("hidden_dim and num_heads must be positive.")
+        if self.hidden_dim % self.num_heads != 0:
+            raise ValueError("hidden_dim must be divisible by num_heads.")
+        if self.num_layers <= 0 or self.num_timesteps <= 0:
+            raise ValueError("num_layers and num_timesteps must be positive.")
+        if self.use_standard_attention and self.use_spike_ssm:
+            raise ValueError(
+                "use_standard_attention and use_spike_ssm are mutually exclusive."
+            )
+        if self.mlp_residual_mode not in {"identity", "spike_first"}:
+            raise ValueError(
+                "mlp_residual_mode must be 'identity' or 'spike_first'."
+            )
+
     def save(self, path):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(asdict(self), f, indent=2)
 
     @classmethod
     def load(cls, path):
-        with open(path) as f:
-            data = json.load(f)
+        raw = Path(path).read_bytes()
+        encoding = "utf-16" if raw.startswith((b"\xff\xfe", b"\xfe\xff")) else "utf-8-sig"
+        data = json.loads(raw.decode(encoding))
+        # Preserve forward semantics for checkpoints created before the
+        # identity residual was introduced.
+        data.setdefault("mlp_residual_mode", "spike_first")
         valid_keys = set(cls.__dataclass_fields__)
         unknown = [k for k in data if k not in valid_keys and not k.startswith("_")]
         if unknown:
@@ -98,6 +125,14 @@ class DataConfig:
     is_finetune: bool = False    # if True, masks the prompt in the loss calculation
     response_template: str = "<|im_start|>assistant\n" # the boundary token to calculate loss after
 
+    def __post_init__(self):
+        if self.max_seq_len <= 1:
+            raise ValueError("max_seq_len must be greater than 1.")
+        if not 0.0 <= self.validation_split < 1.0:
+            raise ValueError("validation_split must be in the [0, 1) interval.")
+        if self.num_workers < 0 or self.num_proc <= 0:
+            raise ValueError("num_workers must be non-negative and num_proc positive.")
+
 
 @dataclass
 class TrainConfig:
@@ -113,6 +148,18 @@ class TrainConfig:
     max_grad_norm: float = 1.0
     weight_decay: float = 0.1
     gradient_checkpointing: bool = False  # trade compute for VRAM
+    
+    # SNN physics override
+    surrogate_slope: float = 5.0  # overrides model_config.surrogate_slope if set during training
+    surrogate_slope_final: Optional[float] = None  # if set, dynamically schedule slope from surrogate_slope to surrogate_slope_final
+
+    # R-STDP (biological learning for spiking MLP layers)
+    use_rstdp: bool = False           # enable hybrid backprop + R-STDP
+    rstdp_lr: float = 1e-3            # R-STDP learning rate (separate from backprop lr)
+    rstdp_tau_plus: float = 20.0      # LTP trace decay time constant
+    rstdp_tau_minus: float = 20.0     # LTD trace decay time constant
+    rstdp_a_plus: float = 0.01        # LTP amplitude
+    rstdp_a_minus: float = 0.0105     # LTD amplitude (slightly > A+ for stability)
 
     bf16: bool = True
     fp16: bool = False
@@ -135,5 +182,5 @@ class TrainConfig:
 
     def save(self, path):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(asdict(self), f, indent=2)
