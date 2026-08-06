@@ -14,6 +14,7 @@ into fixed-length blocks with no padding — the standard approach for
 language model pre-training.
 """
 
+import warnings
 from pathlib import Path
 from functools import partial
 
@@ -64,7 +65,8 @@ def _tokenize_batch(examples, tokenizer, max_seq_len, is_finetune=False,
         # Encode the template
         response_token_ids = tokenizer.encode(response_template, add_special_tokens=False)
         resp_len = len(response_token_ids)
-        
+        n_unmatched = 0
+
         for ids, attn in zip(enc["input_ids"], enc["attention_mask"]):
             # Find the starting index of the response template in the tokens
             match_idx = -1
@@ -83,6 +85,20 @@ def _tokenize_batch(examples, tokenizer, max_seq_len, is_finetune=False,
                 else:
                     cur_labels.append(tok_id)
             labels.append(cur_labels)
+            if match_idx == -1:
+                n_unmatched += 1
+
+        if n_unmatched:
+            # A miss means the prompt was NOT masked and is being trained on as
+            # if it were a response. BPE can split the template differently in
+            # context, so this must be loud rather than silently degrading.
+            warnings.warn(
+                f"response_template {response_template!r} not found in "
+                f"{n_unmatched}/{len(labels)} examples; their prompts are "
+                f"unmasked and will contribute to the loss. Check that the "
+                f"template tokenizes identically inside the full text.",
+                stacklevel=2,
+            )
     else:
         # Default Causal LM pre-training logic
         labels = [
@@ -325,24 +341,115 @@ class LengthGroupedSampler(Sampler):
         return iter(indices)
 
 
+class TokenBudgetBatchSampler(Sampler):
+    """Builds batches with a bounded token count instead of a fixed row count.
+
+    Activation memory scales with batch_size × padded_length, so a fixed
+    batch_size must be sized for the longest batch and wastes capacity on
+    every shorter one. Holding batch_size × L roughly constant instead keeps
+    peak VRAM flat: long sequences get few rows per batch, short ones get many.
+
+    This matters more for an SNN than a Transformer — LIF integration stores
+    T timesteps of activations, so the peak is T× higher for the same shape.
+    """
+
+    def __init__(self, lengths, max_tokens, max_batch_size, shuffle=True,
+                 seed=42, megabatch_mult=50, pad_to_multiple_of=64, drop_last=False):
+        self.lengths = list(lengths)
+        self.max_tokens = max_tokens
+        self.max_batch_size = max_batch_size
+        self.shuffle = shuffle
+        self.seed = seed
+        self.epoch = 0
+        self.megabatch_size = max_batch_size * megabatch_mult
+        self.pad_to_multiple_of = pad_to_multiple_of
+        self.drop_last = drop_last
+        self._batches = None
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+        self._batches = None
+
+    def _padded(self, n):
+        m = self.pad_to_multiple_of
+        return -(-n // m) * m if m > 1 else n
+
+    def _build(self):
+        n = len(self.lengths)
+        if self.shuffle:
+            g = torch.Generator()
+            g.manual_seed(self.seed + self.epoch)
+            order = torch.randperm(n, generator=g).tolist()
+        else:
+            order = list(range(n))
+
+        batches, cur, cur_max = [], [], 0
+        for start in range(0, n, self.megabatch_size):
+            megabatch = order[start:start + self.megabatch_size]
+            megabatch.sort(key=lambda i: self.lengths[i], reverse=True)
+            for idx in megabatch:
+                cand_max = max(cur_max, self._padded(self.lengths[idx]))
+                if cur and ((len(cur) + 1) * cand_max > self.max_tokens
+                            or len(cur) + 1 > self.max_batch_size):
+                    batches.append(cur)
+                    cur, cur_max = [idx], self._padded(self.lengths[idx])
+                else:
+                    cur.append(idx)
+                    cur_max = cand_max
+        if cur and not self.drop_last:
+            batches.append(cur)
+
+        if self.shuffle:
+            g = torch.Generator()
+            g.manual_seed(self.seed + self.epoch + 1)
+            batches = [batches[i] for i in torch.randperm(len(batches), generator=g).tolist()]
+        self._batches = batches
+
+    def __iter__(self):
+        if self._batches is None:
+            self._build()
+        return iter(self._batches)
+
+    def __len__(self):
+        if self._batches is None:
+            self._build()
+        return len(self._batches)
+
+
 def create_dataloader(dataset_split, batch_size, shuffle=True, num_workers=2,
                       drop_last=True, seed=42, pad_id=0, group_by_length=False,
-                      pad_to_multiple_of=64):
+                      pad_to_multiple_of=64, max_tokens_per_batch=0):
     """Create a DataLoader with dynamic padding and deterministic shuffling.
 
     group_by_length sorts similar-length sequences into the same batch, which
     cuts padding waste further on instruction datasets. It is ignored for
     packed datasets, where every row already has the same length.
+
+    max_tokens_per_batch, when > 0, switches to token-budget batching: rows per
+    batch vary so that batch_size × padded_length stays under the budget, which
+    bounds peak VRAM. batch_size then acts only as an upper cap on rows.
     """
     collate = partial(_collate, pad_id=pad_id, pad_to_multiple_of=pad_to_multiple_of)
 
-    sampler = None
-    if group_by_length:
+    lengths = None
+    if group_by_length or max_tokens_per_batch > 0:
         lengths = [len(x) for x in dataset_split["input_ids"]]
         if len(set(lengths)) == 1:
-            group_by_length = False  # packed data: grouping buys nothing
-        else:
-            sampler = LengthGroupedSampler(lengths, batch_size, shuffle, seed)
+            lengths = None  # packed data: every row already the same length
+
+    if lengths is not None and max_tokens_per_batch > 0:
+        batch_sampler = TokenBudgetBatchSampler(
+            lengths, max_tokens_per_batch, batch_size, shuffle, seed,
+            pad_to_multiple_of=pad_to_multiple_of, drop_last=drop_last,
+        )
+        return DataLoader(dataset_split, batch_sampler=batch_sampler,
+                          collate_fn=collate, num_workers=num_workers,
+                          pin_memory=torch.cuda.is_available(),
+                          persistent_workers=num_workers > 0)
+
+    sampler = None
+    if lengths is not None and group_by_length:
+        sampler = LengthGroupedSampler(lengths, batch_size, shuffle, seed)
 
     generator = None
     if shuffle and sampler is None:

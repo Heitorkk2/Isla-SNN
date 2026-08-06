@@ -27,8 +27,11 @@ def spike_fn(membrane, threshold=1.0, slope=5.0):
     This bypasses torch.autograd.Function entirely, preventing
     massive Graph Breaks when used with torch.compile().
     """
-    # Forward: Hard Heaviside step
-    hard_spike = (membrane >= threshold).float()
+    # Forward: Hard Heaviside step.
+    # .to(membrane.dtype) rather than .float(): a hard-coded fp32 here would
+    # promote the whole STE chain and force the LIF to run in fp32 even under
+    # bf16 autocast, doubling activation memory.
+    hard_spike = (membrane >= threshold).to(membrane.dtype)
     
     # Backward: Surrogate Fast Sigmoid (f' = 1 / (1 + slope * |x|)^2)
     # The pure function f(x) = x / (1 + slope * |x|) yields exactly this derivative.
@@ -106,7 +109,12 @@ class LIFNeuron(nn.Module):
         final_membrane is exposed so SpikingMLP can use it as a
         continuous feature alongside binary spikes (v3 improvement).
         """
-        beta = self.beta
+        # beta and adaptation_strength are fp32 parameters; multiplying them
+        # against a bf16 current promotes the whole LIF chain to fp32, which
+        # doubles activation memory and drops off the tensor-core path. Casting
+        # to the input dtype keeps the integration in whatever AMP selected.
+        beta = self.beta.to(current.dtype)
+        adapt_strength = torch.relu(self.adaptation_strength).to(current.dtype)
         membrane = torch.zeros_like(current)
         adaptation = torch.zeros_like(current)
         spike_sum = torch.zeros_like(current)
@@ -139,7 +147,7 @@ class LIFNeuron(nn.Module):
             spikes = spike_fn(membrane, threshold, self.slope)
             membrane = membrane * (1.0 - spikes.detach())
             adaptation = self.adaptation_decay * adaptation + \
-                         torch.relu(self.adaptation_strength) * spikes.detach()
+                         adapt_strength * spikes.detach()
             spike_sum = spike_sum + spikes
 
             if track_traces:
