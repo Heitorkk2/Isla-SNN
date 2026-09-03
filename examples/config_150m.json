@@ -8,7 +8,7 @@
   "dropout": 0.1,
   "beta_init": 0.5,
   "threshold": 0.3,
-  "surrogate_slope": 25.0,
+  "surrogate_slope": 5.0,
   "sync_tau_init": 1.0,
   "spike_reg_lambda": 0.05,
   "target_spike_rate": 0.3,

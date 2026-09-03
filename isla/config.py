@@ -27,7 +27,14 @@ class ModelConfig:
     # LIF neuron parameters
     beta_init: float = 0.9         # membrane decay β₀ (learnable, constrained to (0,1))
     threshold: float = 1.0         # spike threshold θ
-    surrogate_slope: float = 5.0   # steepness k of the surrogate gradient (v3: lowered for better training)
+    # Steepness k of the fast-sigmoid surrogate, f'(x) = 1/(1+k|x|)².
+    # Lower k passes MORE gradient, not less: measured gradient mass is 0.333
+    # at k=2, 0.167 at k=5, 0.063 at k=15, 0.039 at k=25 — so k=25 delivers
+    # 4.3x less signal than k=5. Values of 2-10 are the usual range for this
+    # surrogate; 5 is the tested default. Raising k narrows the window to
+    # neurons near threshold, which is a better match to the true Heaviside
+    # derivative but starves everything else.
+    surrogate_slope: float = 5.0
 
     # spike synchrony attention
     sync_tau_init: float = 1.0     # initial temperature τ₀ for the RBF kernel

@@ -212,7 +212,7 @@ def _ensure_dict_with_split(dataset, validation_split=0.001):
 
 def load_isla_dataset(data_path, tokenizer, max_seq_len=1024, num_proc=4, pack=True,
                       is_finetune=False, response_template="<|im_start|>assistant\n",
-                      validation_split=0.001):
+                      validation_split=0.001, cache_key=None):
     """Load (and optionally tokenize + cache) a dataset.
 
     Args:
@@ -224,6 +224,8 @@ def load_isla_dataset(data_path, tokenizer, max_seq_len=1024, num_proc=4, pack=T
         is_finetune: if True, masks the user prompts with -100
         response_template: identifying tag for the assistant block
         validation_split: fraction reserved when the dataset has no validation split
+        cache_key: optional fingerprint appended to the on-disk cache name. Use
+            this when the source file may be rewritten in place between runs.
     """
     p = Path(data_path)
 
@@ -251,6 +253,11 @@ def load_isla_dataset(data_path, tokenizer, max_seq_len=1024, num_proc=4, pack=T
     # _tokenized_v2 invalidates legacy caches whose rows were padded to
     # max_seq_len; those would defeat the dynamic padding in _collate.
     cache_suffix = "_packed_v2" if pack else "_tokenized_v2"
+    if cache_key:
+        safe_key = "".join(c for c in str(cache_key) if c.isalnum() or c in "-_")
+        if not safe_key:
+            raise ValueError("cache_key must contain at least one safe character")
+        cache_suffix += f"_{safe_key}"
     cached = p.parent / f"{p.stem}{cache_suffix}"
     if cached.is_dir():
         print(f"[DATA] Found cache: {cached}")

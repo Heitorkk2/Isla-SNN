@@ -137,21 +137,30 @@ def run_profiler():
     total_dense_macs = 0
     total_snn_macs = 0
     total_snn_acs = 0
-    
+
+    # Per-layer alpha: the learned weight on the continuous membrane term.
+    alphas = [b.mlp.alpha.item() for b in model.blocks]
+
     for i, rate_tensor in enumerate(rates_per_layer):
         rate = rate_tensor.mean().item()
         sparsity = (1.0 - rate) * 100.0
         
         # SNN up-project is dense (continuous input -> LIF): d_in * d_ff MACs
         layer_snn_macs = d_in * d_ff
-        
-        # SNN down-project is event-driven:
-        # In SNN v2 (pure spikes), we perform only additions (ACs) for active spikes.
-        # In SNN v3, there is mixed membrane potential, but for neuromorphic efficiency comparison, 
-        # the spike rate represents the discrete event-driven activation level.
-        # Active connections: rate * d_ff * d_in ACs
+
+        # SNN down-project: SpikingMLP feeds it `rate + alpha * membrane`.
+        # By linearity that splits into down(rate) + alpha * down(membrane).
+        #   down(rate)     -> event-driven, one accumulate per active connection
+        #   down(membrane) -> membrane is CONTINUOUS, so this is a full dense MAC
+        #                     over every unit whether it spiked or not
+        # A small alpha does not help: any nonzero coefficient still requires the
+        # dense matmul. Counting only the accumulates (as this profiler did until
+        # the alpha ablation was run) overstates the saving by ~2x.
         layer_snn_acs = rate * d_ff * d_in
-        
+        alpha = alphas[i] if i < len(alphas) else 0.0
+        if alpha > 0:
+            layer_snn_macs += d_ff * d_in
+
         layer_dense_macs = ffn_dense_macs_per_token_per_layer
         
         total_dense_macs += layer_dense_macs
@@ -185,7 +194,16 @@ def run_profiler():
     print("-" * 70)
     print(f"[*] Standard FFN Energy:      {energy_dense_pj:,.2f} pJ / token")
     print(f"[*] Isla-SNN FFN Energy:      {energy_snn_pj:,.2f} pJ / token")
-    print(f"[SUCCESS] Neuromorphic Energy Saved: {energy_saved_pct:.2f}%")
+    label = "Energy Saved" if energy_saved_pct > 0 else "Energy COST"
+    print(f"[*] Neuromorphic {label}: {abs(energy_saved_pct):.2f}%")
+
+    mean_alpha = sum(alphas) / len(alphas)
+    if mean_alpha > 0:
+        print("-" * 70)
+        print(f"[!] alpha = {mean_alpha:.4f} > 0: the continuous membrane term forces a")
+        print("    dense down-projection, so the FFN is NOT event-driven. The figure")
+        print("    above already accounts for that. Run experiments/alpha_ablation.py")
+        print("    to measure what alpha buys before trying to remove it.")
     print("=" * 70)
     
     # 3. Dynamic scale estimation
@@ -196,11 +214,19 @@ def run_profiler():
     print(f"    - Dense FFN energy:      {energy_dense_pj * tokens_num * 1e-6:.4f} uJ")
     print(f"    - Isla-SNN FFN energy:   {energy_snn_pj * tokens_num * 1e-6:.4f} uJ")
     print(f"    - Absolute Energy Saved: {(energy_dense_pj - energy_snn_pj) * tokens_num * 1e-6:.4f} uJ")
-    print(f"    - Neuromorphic Factor:   {energy_dense_pj / energy_snn_pj:.2f}x more efficient!")
+    print(f"    - Neuromorphic Factor:   {energy_dense_pj / energy_snn_pj:.2f}x")
 
     print("=" * 70)
-    print("Note: Energy calculations assume 45nm CMOS standard technology for MACs (120fJ)")
-    print("and specialized Neuromorphic ASIC technology for Event-driven ACs (20fJ).")
+    print("Scope and assumptions — read before quoting these numbers:")
+    print("  * FFN only. Attention projections and the LM head are NOT counted,")
+    print("    and together they are ~48% of per-token MACs, so whole-model")
+    print("    savings are roughly half of the FFN-only figure above.")
+    print("  * 45nm CMOS for MACs (120 fJ) and a neuromorphic ASIC for ACs (20 fJ).")
+    print("    No such chip runs this architecture today; this is a model, not a")
+    print("    measurement. On GPU the SNN is slower than a dense transformer.")
+    print("  * Rate coding trades precision for events: with T timesteps the AC")
+    print("    count scales with T, and event-driven stops beating dense at")
+    print("    T ~ 21 (only ~4.5 bits of precision). See README.")
     print("=" * 70)
 
 

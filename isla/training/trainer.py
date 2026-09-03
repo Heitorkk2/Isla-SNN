@@ -361,6 +361,10 @@ class IslaTrainer:
         steps_per_epoch = len(train_loader) // self.cfg.gradient_accumulation_steps
         if self.cfg.max_steps <= 0:
             self.cfg.max_steps = steps_per_epoch * self.cfg.num_epochs
+        displayed_epochs = max(
+            self.cfg.num_epochs,
+            math.ceil(self.cfg.max_steps / max(steps_per_epoch, 1)),
+        )
 
         print(f"[TRAIN] epochs={self.cfg.num_epochs}  steps={self.cfg.max_steps:,}  "
               f"steps/epoch={steps_per_epoch:,}  eff_batch={eff}")
@@ -370,8 +374,8 @@ class IslaTrainer:
         epoch = 0
         it = iter(train_loader)
 
-        pbar = tqdm(total=self.cfg.max_steps, initial=self.step, 
-                    desc=f"Epoch {epoch+1}/{self.cfg.num_epochs} [Train]", dynamic_ncols=True)
+        pbar = tqdm(total=self.cfg.max_steps, initial=self.step,
+                    desc=f"Epoch {epoch+1}/{displayed_epochs} [Train]", dynamic_ncols=True)
 
         try:
             while self.step < self.cfg.max_steps:
@@ -384,7 +388,7 @@ class IslaTrainer:
                         batch = next(it)
                     except StopIteration:
                         epoch += 1
-                        pbar.set_description(f"Epoch {epoch+1}/{self.cfg.num_epochs} [Train]")
+                        pbar.set_description(f"Epoch {epoch+1}/{displayed_epochs} [Train]")
                         it = iter(train_loader)
                         batch = next(it)
                     m = self._forward_backward(batch)

@@ -156,12 +156,96 @@ New models use an identity-preserving gated MLP residual, `h = h + gate · mlp(h
 | Ablation | Swap to standard dot-product attention via config flag |
 | Packaging | `pip install -e .` via pyproject.toml |
 
+## Measured Findings
+
+These come from auditing the trained 134M checkpoint (2B PT-BR tokens) against
+`nicholasKluge/TeenyTinyLlama-160m`, which shares the same tokenizer, on 295
+held-out Portuguese Wikipedia articles. Scripts are in `experiments/`.
+
+### Energy: the FFN is not event-driven
+
+`SpikingMLP` computes `down(rate + alpha * membrane)`. The `rate` half is
+event-driven, but `membrane` is continuous, so by linearity the second half is a
+full dense matmul over every unit. A small `alpha` does not avoid it. Counting
+only the accumulates — as the profiler originally did — overstates the saving:
+
+| accounting | pJ/token | vs dense |
+|---|---|---|
+| dense FFN baseline | 6,794,772 | — |
+| FFN, accumulates only (original claim) | 3,558,026 | +47.6% |
+| FFN, membrane term included | 6,955,412 | **−2.4%** |
+
+Removing `alpha` is not a free fix. Sweeping it on the trained model:
+
+| alpha scale | ×1.5 | ×1.0 | ×0.75 | ×0.5 | ×0.25 | ×0 |
+|---|---|---|---|---|---|---|
+| perplexity | 365 | **304** | 337 | 715 | 2,764 | 7,276 |
+
+The trained value is a genuine optimum, and losing membrane is 6.7× more
+damaging than having too much of it and the degradation is smooth rather than a
+cliff, so this is information loss, not a calibration shock. The continuous term
+is load-bearing.
+
+Compensating with more timesteps does not work either, because spike events
+scale with `T`:
+
+| T | levels | bits | energy vs dense |
+|---|---|---|---|
+| 4 | 5 | 2.3 | 0.19× |
+| 8 | 9 | 3.2 | 0.38× |
+| 16 | 17 | 4.1 | 0.76× |
+| 21 | 22 | 4.5 | **1.00×** |
+
+Event-driven stops beating dense at `T ≈ 21`, where rate coding still carries
+only ~4.5 bits. Rate coding is efficient only when the task tolerates low
+precision, and language modeling does not.
+
+**Whole-model ceiling, if `alpha` could be removed: ~25%, not 91%.** The FFN is
+52% of per-token MACs; attention projections and the LM head are the rest.
+
+### Capability: a 1.76× gap not explained by data
+
+| | bits/char | perplexity |
+|---|---|---|
+| Isla-134M (2B tokens) | 1.7488 | 304.0 |
+| TeenyTinyLlama-160m (~6.2B tokens) | 0.8898 | 18.3 |
+
+Use bits/char — token perplexity is only comparable because the tokenizers are
+identical here. Scaling laws attribute roughly 15% of the gap to TTL's 3.1×
+larger token budget and 19% more parameters, leaving ~1.76× unexplained.
+
+### Likely cause: the residual gate starves the MLP
+
+`SpikingBlock` computes `h = h + gate * mlp_out`, with `gate_raw` initialised at
+−2.0. After 2B tokens the gate had moved from 0.119 to only 0.131. Because the
+gate also scales the gradient reaching the MLP, the branch trains ~7.7× slower
+than an ungated residual, never becomes useful, and the gate never opens.
+
+Measuring `‖mlp‖ / ‖h‖` per layer, averaged over layers 1-11 (layer 0 is an
+outlier in both models):
+
+| | after gate | gate divided out | TTL-160m |
+|---|---|---|---|
+| mean contribution | 0.1412 | **1.0748** | 0.4445 |
+
+The apparent 3.1× deficit inverts once the gate is removed: the spiking MLP
+emits 2.4× *more* signal than the baseline's, and the gate discards it. The
+deficit survives only in the last third of the stack (layers 9-11), where
+contribution falls to 0.19× of the first third while TTL's *rises* to 1.37×.
+
+This is evidence, not proof that large output norm is not the same as useful
+output, and a model trained at gate 0.13 is optimal at 0.13 by construction, so
+sweeping a trained checkpoint cannot settle it. `experiments/nano_grid.py` runs
+the controlled comparison at nano scale.
+
 ## Known Limitations
 
 | Limitation | Detail |
 |---|---|
+| **Energy claims need care** | The FFN is not event-driven while `alpha > 0`; see Measured Findings. `profile_efficiency.py` reports FFN only, on modelled ASIC costs, not measured hardware. |
+| **Capability gap** | ~1.76× worse bits/char than a size-matched Llama, cause not yet isolated. |
 | **O(L²) attention** | Spike sync attention uses custom RBF kernel — not compatible with FlashAttention or xformers. Sequence lengths above 2048 will be slow. |
-| **Sequential LIF timesteps** | Each spiking MLP runs T timesteps sequentially (T=4 by default), making FFN blocks ~4× slower than standard GELU/SiLU. |
+| **Sequential LIF timesteps** | Each spiking MLP runs T timesteps sequentially (T=4 by default), making FFN blocks ~4× slower than standard GELU/SiLU. On GPU the model is slower than a dense transformer of the same size. |
 | **Single GPU** | No distributed training (DDP/FSDP) support yet. |
 
 ## Requirements
